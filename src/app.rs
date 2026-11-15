@@ -10,6 +10,7 @@ use crate::audio::{self, Engine, Event, Peaks};
 use crate::export;
 use crate::library;
 use crate::osu::{self, Meta, RedLine};
+use crate::theme::{self, Palette, ThemeState};
 use crate::project::{self, Content, ControlPoint, Project, ProjectEntry, SampleEntry, SampleRef, Track};
 
 const HEADER_W: f32 = 290.0;
@@ -17,28 +18,91 @@ const WAVE_H: f32 = 84.0;
 const LANE_H: f32 = 58.0;
 const ROW_H: f32 = 54.0;
 const DIVISORS: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
-const PALETTE: [Color32; 8] = [
-    Color32::from_rgb(110, 140, 255),
-    Color32::from_rgb(255, 140, 90),
-    Color32::from_rgb(90, 200, 140),
-    Color32::from_rgb(240, 200, 80),
-    Color32::from_rgb(200, 110, 230),
-    Color32::from_rgb(80, 200, 220),
-    Color32::from_rgb(240, 100, 130),
-    Color32::from_rgb(170, 170, 170),
-];
 
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
     last_dir: Option<PathBuf>,
     song_volume: f32,
     hit_volume: f32,
+    dark_mode: bool,
+    dark_palette: usize,
+    light_palette: usize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0 }
+        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0 }
     }
+}
+
+impl Settings {
+    fn palette(&self) -> Palette {
+        if self.dark_mode { theme::DARK[self.dark_palette.min(4)] } else { theme::LIGHT[self.light_palette.min(4)] }
+    }
+}
+
+/// Mode switch plus palette swatches. Returns true when the user picked something.
+fn theme_menu(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
+    let mut changed = false;
+    let label = "Theme";
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(250.0);
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!settings.dark_mode, "Light").clicked() && settings.dark_mode {
+                settings.dark_mode = false;
+                changed = true;
+            }
+            if ui.selectable_label(settings.dark_mode, "Dark").clicked() && !settings.dark_mode {
+                settings.dark_mode = true;
+                changed = true;
+            }
+            ui.label(egui::RichText::new("Ctrl+T switches").small().weak());
+        });
+        for (dark, list) in [(true, &theme::DARK), (false, &theme::LIGHT)] {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(if dark { "Dark palettes" } else { "Light palettes" }).small().weak());
+            for (i, p) in list.iter().enumerate() {
+                let current = if dark { settings.dark_palette } else { settings.light_palette };
+                let selected = settings.dark_mode == dark && current == i;
+                if swatch(ui, p, selected).clicked() {
+                    settings.dark_mode = dark;
+                    if dark {
+                        settings.dark_palette = i;
+                    } else {
+                        settings.light_palette = i;
+                    }
+                    changed = true;
+                }
+            }
+        }
+    });
+    changed
+}
+
+/// One clickable palette preview drawn in its own colours.
+fn swatch(ui: &mut egui::Ui, p: &Palette, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(240.0), 30.0), Sense::click());
+    let painter = ui.painter();
+    let stroke = if selected {
+        Stroke::new(2.0, p.accent)
+    } else if resp.hovered() {
+        Stroke::new(1.0, p.accent)
+    } else {
+        Stroke::new(1.0, p.border)
+    };
+    painter.rect_filled(rect, CornerRadius::same(6), p.bg);
+    painter.rect_stroke(rect, CornerRadius::same(6), stroke, StrokeKind::Inside);
+    let mut x = rect.left() + 14.0;
+    for c in [p.accent, p.tracks[1], p.tracks[2], p.tracks[3], p.tracks[4]] {
+        painter.circle_filled(pos2(x, rect.center().y), 6.0, c);
+        x += 15.0;
+    }
+    painter.text(pos2(x + 6.0, rect.center().y), Align2::LEFT_CENTER, p.name, FontId::proportional(13.0), p.text);
+    if selected {
+        painter.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, "current", FontId::proportional(11.0), p.text_weak);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 struct Picked {
@@ -72,6 +136,10 @@ pub struct App {
     audio_error: Option<String>,
     screen: Screen,
     home: Home,
+    theme: ThemeState,
+    pal: Palette,
+    theme_changed: bool,
+    logo: Option<egui::TextureHandle>,
 }
 
 fn data_dir() -> PathBuf {
@@ -127,7 +195,9 @@ impl App {
             }
             Err(e) => (None, Some(format!("Audio output unavailable: {e}"))),
         };
-        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default() };
+        let theme = ThemeState::new(settings.palette());
+        let pal = *theme.target();
+        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, logo: load_logo(&cc.egui_ctx) };
         app.refresh_projects();
         app
     }
@@ -193,8 +263,16 @@ impl App {
         egui::Panel::top("home-top").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    ui.image((logo.id(), vec2(28.0, 28.0)));
+                }
                 ui.heading("hitsmith");
                 ui.label(egui::RichText::new("hitsounding workstation for osu!").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme_menu(ui, &mut self.settings) {
+                        self.theme_changed = true;
+                    }
+                });
             });
             ui.add_space(6.0);
         });
@@ -243,7 +321,7 @@ impl App {
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.add_space(8.0);
             if let Some(err) = &self.audio_error {
-                ui.colored_label(Color32::from_rgb(240, 180, 80), err);
+                ui.colored_label(self.pal.warn, err);
             }
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(egui::RichText::new("Open beatmap...").size(16.0)).min_size(vec2(180.0, 34.0))).clicked() {
@@ -253,7 +331,7 @@ impl App {
             });
             ui.add_space(10.0);
             if let Some(err) = &self.home.error {
-                ui.colored_label(Color32::from_rgb(240, 110, 110), err);
+                ui.colored_label(self.pal.danger, err);
             }
             let mut switch_to = None;
             let mut create = false;
@@ -320,12 +398,12 @@ impl App {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("confirm-delete")).show(&ctx, |ui| {
                 ui.heading("Delete project?");
-                ui.label(format!("\"{name}\" and its imported samples will be deleted. Exported difficulties in the mapset stay. This can't be undone."));
+                ui.label(format!("\"{name}\" and its imported samples will be moved to the Recycle Bin, so you can restore it from there. Exported difficulties in the mapset stay."));
                 ui.horizontal(|ui| {
                     if ui.button("Delete").clicked() {
                         if dir.parent() == Some(self.projects_dir.as_path()) && dir.join("project.json").is_file() {
-                            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                                self.home.error = Some(format!("Couldn't delete: {e}"));
+                            if let Err(e) = project::move_to_recycle_bin(&dir) {
+                                self.home.error = Some(format!("Couldn't delete: {e:#}"));
                             }
                         }
                         close = true;
@@ -343,6 +421,12 @@ impl App {
     }
 }
 
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(crate::LOGO_PNG).ok()?.thumbnail(64, 64).to_rgba8();
+    let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+    Some(ctx.load_texture("logo", color, egui::TextureOptions::LINEAR))
+}
+
 fn load_background(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
     if !path.is_file() {
         return None;
@@ -356,12 +440,26 @@ fn load_background(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHand
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if ui.input(|i| i.modifiers.command && i.key_pressed(Key::T)) {
+            self.settings.dark_mode = !self.settings.dark_mode;
+            self.theme_changed = true;
+        }
+        if std::mem::take(&mut self.theme_changed) {
+            self.theme.switch_to(self.settings.palette());
+            self.save_settings();
+        }
+        self.pal = self.theme.apply(&ctx);
         let mut go_home = false;
         match &mut self.screen {
             Screen::Home => self.home_ui(ui),
             Screen::Work(w) => {
                 let mut vols = (self.settings.song_volume, self.settings.hit_volume);
-                go_home = w.ui(ui, self.engine.as_ref(), &mut vols);
+                w.pal = self.pal;
+                let settings = &mut self.settings;
+                let mut picked = false;
+                go_home = w.ui(ui, self.engine.as_ref(), &mut vols, &mut |ui: &mut egui::Ui| picked |= theme_menu(ui, settings));
+                self.theme_changed |= picked;
                 if vols != (self.settings.song_volume, self.settings.hit_volume) {
                     self.settings.song_volume = vols.0;
                     self.settings.hit_volume = vols.1;
@@ -431,6 +529,7 @@ struct Work {
     save_error: Option<String>,
     follow: bool,
     skin_dir: Option<PathBuf>,
+    pal: Palette,
 }
 
 impl Work {
@@ -474,6 +573,7 @@ impl Work {
             confirm_remove: None,
             save_error: None,
             follow: true,
+            pal: theme::DARK[0],
         };
         if let Some(e) = engine {
             e.set_song(Arc::new(Vec::new()));
@@ -598,12 +698,12 @@ impl Work {
         // Prefer a sample no other track uses yet.
         let used: Vec<&SampleRef> = self.project.content.tracks.iter().filter_map(|t| t.sample.as_ref()).collect();
         let sample = self.library.iter().find(|e| !used.contains(&&e.r)).or(self.library.first()).map(|e| e.r.clone());
-        self.project.content.tracks.push(Track { id, name: format!("Track {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % PALETTE.len()) as u8, notes: Vec::new() });
+        self.project.content.tracks.push(Track { id, name: format!("Track {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % 8) as u8, notes: Vec::new() });
         self.changed(engine);
     }
 
     /// Returns true when the user wants to go back home.
-    fn ui(&mut self, ui: &mut egui::Ui, engine: Option<&Engine>, vols: &mut (f32, f32)) -> bool {
+    fn ui(&mut self, ui: &mut egui::Ui, engine: Option<&Engine>, vols: &mut (f32, f32), theme_ui: &mut dyn FnMut(&mut egui::Ui)) -> bool {
         let ctx = ui.ctx().clone();
         if let Some(rx) = &self.song_rx {
             if let Ok(r) = rx.try_recv() {
@@ -706,11 +806,13 @@ impl Work {
                 });
                 ui.toggle_value(&mut self.follow, "Follow").on_hover_text("Keep the playhead in view while playing");
                 ui.separator();
+                ui.spacing_mut().slider_width = 70.0;
                 ui.label("Song");
                 ui.add(egui::Slider::new(&mut vols.0, 0.0..=1.0).show_value(false)).on_hover_text("Song volume");
                 ui.label("Hits");
                 ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    theme_ui(ui);
                     if ui.button("Export…").clicked() {
                         self.export_open = true;
                         self.export_result = None;
@@ -750,7 +852,7 @@ impl Work {
                     self.dirty = true;
                 }
                 let status = if let Some(e) = &self.save_error {
-                    egui::RichText::new(e).color(Color32::from_rgb(240, 110, 110))
+                    egui::RichText::new(e).color(self.pal.danger)
                 } else if self.dirty {
                     egui::RichText::new("Saving…").weak()
                 } else {
@@ -762,7 +864,7 @@ impl Work {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             if let Some(e) = &self.song_error {
-                ui.colored_label(Color32::from_rgb(240, 110, 110), format!("Couldn't load the song: {e}"));
+                ui.colored_label(self.pal.danger, format!("Couldn't load the song: {e}"));
             } else if self.song.is_none() {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -924,13 +1026,13 @@ impl Work {
                 }
                 match &self.export_result {
                     Some(Ok(m)) => {
-                        ui.colored_label(Color32::from_rgb(120, 210, 140), m);
+                        ui.colored_label(self.pal.success, m);
                         if ui.button("Open mapset folder").clicked() {
                             let _ = std::process::Command::new("explorer").arg(&self.project.mapset_dir).spawn();
                         }
                     }
                     Some(Err(e)) => {
-                        ui.colored_label(Color32::from_rgb(240, 110, 110), e);
+                        ui.colored_label(self.pal.danger, e);
                     }
                     None => {}
                 }
@@ -946,7 +1048,7 @@ impl Work {
         let mut remove = false;
         let library = self.library.clone();
         let t = &mut self.project.content.tracks[ti];
-        let color = PALETTE[t.color as usize % PALETTE.len()];
+        let color = self.pal.tracks[t.color as usize % 8];
         let (bar, _) = ui.allocate_exact_size(vec2(4.0, ROW_H - 6.0), Sense::hover());
         ui.painter().rect_filled(bar, 2.0, color);
         ui.vertical(|ui| {
@@ -1017,18 +1119,18 @@ impl Work {
             }
             let x = self.x_of(rect, t);
             let c = if measure {
-                Color32::from_gray(150)
+                self.pal.grid_measure
             } else if sub == 0 {
-                Color32::from_gray(95)
+                self.pal.grid_beat
             } else {
-                Color32::from_rgba_unmultiplied(140, 150, 200, 45)
+                self.pal.grid_sub
             };
             painter.vline(x, rect.y_range(), Stroke::new(1.0, c));
         });
         for r in &self.reds {
             let x = self.x_of(rect, r.offset);
             if rect.x_range().contains(x) {
-                painter.vline(x, rect.y_range(), Stroke::new(1.5, Color32::from_rgb(220, 70, 70)));
+                painter.vline(x, rect.y_range(), Stroke::new(1.5, self.pal.red_line));
             }
         }
     }
@@ -1036,13 +1138,13 @@ impl Work {
     fn draw_playhead(&self, painter: &egui::Painter, rect: Rect, pos: f64) {
         let x = self.x_of(rect, pos);
         if rect.x_range().contains(x) {
-            painter.vline(x, rect.y_range(), Stroke::new(2.0, Color32::from_rgb(255, 230, 120)));
+            painter.vline(x, rect.y_range(), Stroke::new(2.0, self.pal.playhead));
         }
     }
 
     fn wave_lane(&mut self, ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(18, 20, 28));
+        painter.rect_filled(rect, CornerRadius::same(4), self.pal.wave_bg);
         self.draw_grid(&painter, rect, true);
         if let Some(song) = &self.song {
             let p = &song.peaks;
@@ -1058,7 +1160,7 @@ impl Work {
                     let ib = ib.min(p.mins.len());
                     let lo = p.mins[ia..ib].iter().cloned().fold(0.0, f32::min);
                     let hi = p.maxs[ia..ib].iter().cloned().fold(0.0, f32::max);
-                    painter.vline(x, (mid - hi * half)..=(mid - lo * half).max(mid - hi * half + 1.0), Stroke::new(1.0, Color32::from_rgb(105, 130, 230)));
+                    painter.vline(x, (mid - hi * half)..=(mid - lo * half).max(mid - hi * half + 1.0), Stroke::new(1.0, self.pal.wave));
                 }
                 x += 1.0;
             }
@@ -1097,7 +1199,7 @@ impl Work {
 
     fn volume_lane(&mut self, ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(20, 24, 34));
+        painter.rect_filled(rect, CornerRadius::same(4), self.pal.lane);
         self.draw_grid(&painter, rect, true);
         let mut cps = self.project.content.control_points.clone();
         if let Some(Drag::Point { idx, cur, .. }) = &self.drag {
@@ -1106,7 +1208,7 @@ impl Work {
                 cps.sort_by_key(|c| c.time);
             }
         }
-        let fill = Color32::from_rgba_unmultiplied(110, 140, 255, 50);
+        let fill = self.pal.vol_fill;
         for (i, c) in cps.iter().enumerate() {
             let x0 = if i == 0 { rect.left() } else { self.x_of(rect, c.time as f64).max(rect.left()) };
             let x1 = cps.get(i + 1).map(|n| self.x_of(rect, n.time as f64)).unwrap_or(rect.right()).min(rect.right());
@@ -1115,14 +1217,14 @@ impl Work {
             }
             let y = Self::vol_y(rect, c.volume);
             painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, rect.bottom())), 0.0, fill);
-            painter.hline(x0..=x1, y, Stroke::new(1.5, Color32::from_rgb(130, 160, 255)));
+            painter.hline(x0..=x1, y, Stroke::new(1.5, self.pal.vol_line));
         }
         for c in &cps {
             let x = self.x_of(rect, c.time as f64);
             if rect.x_range().contains(x) {
                 let y = Self::vol_y(rect, c.volume);
-                painter.circle_filled(pos2(x, y), 5.0, Color32::from_rgb(200, 215, 255));
-                painter.text(pos2(x + 7.0, y - 2.0), Align2::LEFT_BOTTOM, format!("{}%", c.volume), FontId::proportional(11.0), Color32::from_gray(200));
+                painter.circle_filled(pos2(x, y), 5.0, self.pal.vol_line);
+                painter.text(pos2(x + 7.0, y - 2.0), Align2::LEFT_BOTTOM, format!("{}%", c.volume), FontId::proportional(11.0), self.pal.text);
             }
         }
         self.draw_playhead(&painter, rect, pos);
@@ -1190,9 +1292,9 @@ impl Work {
     fn track_lane(&mut self, ui: &mut egui::Ui, ti: usize, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
         let painter = ui.painter_at(rect);
         let track = &self.project.content.tracks[ti];
-        let color = PALETTE[track.color as usize % PALETTE.len()];
+        let color = self.pal.tracks[track.color as usize % 8];
         let dim = !self.project.audible(track);
-        painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(24, 27, 36));
+        painter.rect_filled(rect, CornerRadius::same(4), self.pal.lane);
         self.draw_grid(&painter, rect, false);
         let t0 = self.t_of(rect, rect.left() - 10.0) as i64;
         let t1 = self.t_of(rect, rect.right() + 10.0) as i64;
@@ -1218,7 +1320,7 @@ impl Work {
         }
         if let Some((_, c)) = dragging {
             let x = self.x_of(rect, c as f64);
-            painter.vline(x, rect.y_range(), Stroke::new(1.0, Color32::WHITE));
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, self.pal.text));
         }
         // Hover ghost for the snapped position.
         if self.drag.is_none() {
@@ -1300,10 +1402,10 @@ impl Work {
         }
         if let Some(path) = self.project.content.tracks[ti].sample.as_ref().and_then(|s| self.sample_path(s)) {
             if let Some(err) = self.sample_errors.get(&path) {
-                painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Can't play sample: {err}"), FontId::proportional(11.0), Color32::from_rgb(240, 110, 110));
+                painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Can't play sample: {err}"), FontId::proportional(11.0), self.pal.danger);
             }
         } else if let Some(s) = &self.project.content.tracks[ti].sample {
-            painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Missing sample: {}", s.file), FontId::proportional(11.0), Color32::from_rgb(240, 110, 110));
+            painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Missing sample: {}", s.file), FontId::proportional(11.0), self.pal.danger);
         }
     }
 }

@@ -336,3 +336,37 @@ mod tests {
         assert_eq!(p.volume_at(2000), 80);
     }
 }
+
+/// Move a folder to the Windows Recycle Bin so a deleted project can be restored.
+pub fn move_to_recycle_bin(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
+    let abs = std::path::absolute(path)?;
+    // pFrom is a list of paths, so it needs a double NUL terminator.
+    let mut wide: Vec<u16> = abs.as_os_str().encode_wide().collect();
+    wide.extend([0, 0]);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: wide.as_ptr(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        ..Default::default()
+    };
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 || op.fAnyOperationsAborted != 0 {
+        bail!("Windows couldn't move it to the Recycle Bin (code {code}).");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    #[test]
+    #[ignore = "puts a folder in the real Recycle Bin; run with --ignored"]
+    fn recycles_a_folder() {
+        let dir = std::env::temp_dir().join(format!("hitsmith-recycle-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("samples")).unwrap();
+        std::fs::write(dir.join("project.json"), b"{}").unwrap();
+        super::move_to_recycle_bin(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+}
