@@ -29,11 +29,12 @@ struct Settings {
     dark_mode: bool,
     dark_palette: usize,
     light_palette: usize,
+    scrub_sound: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0 }
+        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0, scrub_sound: false }
     }
 }
 
@@ -206,6 +207,7 @@ impl App {
         let (engine, audio_error) = match Engine::new() {
             Ok(e) => {
                 e.set_gains(settings.song_volume, settings.hit_volume);
+                e.set_scrub_sound(settings.scrub_sound);
                 (Some(e), None)
             }
             Err(e) => (None, Some(format!("Audio output unavailable: {e}"))),
@@ -619,10 +621,15 @@ impl eframe::App for App {
             Screen::Work(w) => {
                 let mut vols = (self.settings.song_volume, self.settings.hit_volume);
                 w.pal = self.pal;
+                w.scrub_sound = self.settings.scrub_sound;
                 let settings = &mut self.settings;
                 let mut picked = false;
                 go_home = w.ui(ui, self.engine.as_ref(), &mut vols, &mut |ui: &mut egui::Ui| picked |= theme_menu(ui, settings));
                 self.theme_changed |= picked;
+                if w.scrub_sound != self.settings.scrub_sound {
+                    self.settings.scrub_sound = w.scrub_sound;
+                    self.save_settings();
+                }
                 if vols != (self.settings.song_volume, self.settings.hit_volume) {
                     self.settings.song_volume = vols.0;
                     self.settings.hit_volume = vols.1;
@@ -721,6 +728,8 @@ struct Work {
     renaming: Option<(u64, String)>,
     pos_now: f64,
     playing_now: bool,
+    /// Mirrors the saved setting; the App writes it back when it changes.
+    scrub_sound: bool,
 }
 
 impl Work {
@@ -779,6 +788,7 @@ impl Work {
             renaming: None,
             pos_now: 0.0,
             playing_now: false,
+            scrub_sound: false,
         };
         if let Some(e) = engine {
             e.set_song(Arc::new(Vec::new()));
@@ -1006,6 +1016,12 @@ impl Work {
                     }
                     if ui.button("Keyboard shortcuts").clicked() {
                         self.show_keys = true;
+                    }
+                    if ui.checkbox(&mut self.scrub_sound, "Scrub sound").on_hover_text("Wheel and arrow seeks glide like dragging a record (with sound) instead of jumping").changed() {
+                        if let Some(e) = engine {
+                            e.set_scrub_sound(self.scrub_sound);
+                        }
+                        self.toast(if self.scrub_sound { "Scrub sound on" } else { "Scrub sound off" });
                     }
                     if ui.button("Open mapset folder").clicked() {
                         let _ = std::process::Command::new("explorer").arg(&self.project.mapset_dir).spawn();

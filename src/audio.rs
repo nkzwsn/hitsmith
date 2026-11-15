@@ -150,6 +150,8 @@ struct Voice {
 const SCRUB_TAU_SECS: f64 = 0.07;
 const SCRUB_INERTIA_SECS: f64 = 0.018;
 const SCRUB_MAX_SPEED: f64 = 10.0;
+/// Length of the fade around an instant jump, so it doesn't click.
+const JUMP_FADE_SECS: f64 = 0.005;
 
 #[derive(Default)]
 struct Mix {
@@ -162,6 +164,12 @@ struct Mix {
     target: Option<f64>,
     /// Current head velocity in frames per output frame.
     vel: f64,
+    /// Play the vinyl-style scrub when seeking by ticks (off: instant jumps).
+    scrub_sound: bool,
+    /// An instant jump waiting for the fade-out to finish.
+    pending_jump: Option<f64>,
+    /// Song gain used to fade around jumps (0..1).
+    fade: f32,
     sr: f64,
     song_gain: f32,
     hit_gain: f32,
@@ -194,7 +202,7 @@ struct Shared {
 impl Shared {
     fn publish(&self, m: &Mix) {
         self.pos.store(m.pos.to_bits(), Ordering::Relaxed);
-        self.target.store(m.target.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
+        self.target.store(m.target.or(m.pending_jump).unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
         self.playing.store(m.playing, Ordering::Relaxed);
     }
 }
@@ -215,7 +223,7 @@ impl Engine {
         let config: cpal::StreamConfig = supported.into();
         let rate = config.sample_rate;
         let channels = config.channels as usize;
-        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, sr: rate as f64, ..Default::default() }));
+        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, sr: rate as f64, fade: 1.0, ..Default::default() }));
         let shared = Arc::new(Shared::default());
         let (m, sh) = (mix.clone(), shared.clone());
         let err = |e| eprintln!("audio stream error: {e}");
@@ -286,19 +294,35 @@ impl Engine {
         self.with(|m| {
             m.pos = frame;
             m.target = None;
+            m.pending_jump = None;
+            m.fade = 1.0;
             m.vel = m.base_speed();
             m.reset_cursor();
         });
     }
-    /// Glide to a time with a vinyl-style scrub instead of a hard cut.
+    /// Seek by ticks: a vinyl-style glide if scrub sound is on, otherwise an
+    /// instant jump with a tiny fade so it doesn't click.
     pub fn scrub_to_ms(&self, ms: f64) {
         let frame = ms.max(0.0) * self.rate as f64 / 1000.0;
         self.with(|m| {
-            if m.target.is_none() {
-                m.vel = m.base_speed();
+            if m.scrub_sound {
+                if m.target.is_none() {
+                    m.vel = m.base_speed();
+                }
+                m.target = Some(frame);
+            } else if m.playing {
+                m.target = None;
+                m.pending_jump = Some(frame);
+            } else {
+                // Nothing audible to fade while paused.
+                m.pos = frame;
+                m.pending_jump = None;
+                m.reset_cursor();
             }
-            m.target = Some(frame);
         });
+    }
+    pub fn set_scrub_sound(&self, on: bool) {
+        self.with(|m| m.scrub_sound = on);
     }
     /// Where the head is right now (moves smoothly while scrubbing).
     pub fn position_ms(&self) -> f64 {
@@ -353,8 +377,21 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
     let m = &mut *guard;
     let tau = SCRUB_TAU_SECS * m.sr;
     let inertia = 1.0 / (SCRUB_INERTIA_SECS * m.sr);
+    let fade_step = (1.0 / (JUMP_FADE_SECS * m.sr)) as f32;
     for frame in out.chunks_mut(channels) {
         let (mut l, mut r) = (0f32, 0f32);
+        // Instant jump: fade the song out, move, then fade back in.
+        if let Some(to) = m.pending_jump {
+            m.fade -= fade_step;
+            if m.fade <= 0.0 {
+                m.fade = 0.0;
+                m.pos = to;
+                m.pending_jump = None;
+                m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
+            }
+        } else if m.fade < 1.0 {
+            m.fade = (m.fade + fade_step).min(1.0);
+        }
         let base = m.base_speed();
         let scrubbing = m.target.is_some();
         if let Some(tg) = m.target.as_mut() {
@@ -384,7 +421,7 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
                     m.cursor += 1;
                 }
             }
-            let g = m.song_gain / 32768.0;
+            let g = m.song_gain * m.fade / 32768.0;
             let (sl, sr) = song_frame(&m.song, m.pos);
             l += sl * g;
             r += sr * g;
@@ -477,6 +514,8 @@ mod scrub_tests {
             pos: sr * 2.0,
             rate: 1.0,
             playing: true,
+            scrub_sound: true,
+            fade: 1.0,
             sr,
             song_gain: 1.0,
             hit_gain: 1.0,
@@ -506,5 +545,28 @@ mod scrub_tests {
         let expect = (2.0 - 0.3 + 0.6) * sr;
         assert!((m.pos - expect).abs() < 0.01 * sr, "landed at {} s, expected ~2.3 s", m.pos / sr);
         assert!((m.vel - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+
+    #[test]
+    fn default_seek_jumps_with_a_short_fade() {
+        let sr = 48_000.0;
+        let mix = Mutex::new(Mix { song: Arc::new(vec![1000i16; 48_000 * 2 * 10]), pos: sr * 2.0, rate: 1.0, playing: true, sr, fade: 1.0, song_gain: 1.0, hit_gain: 1.0, master: 1.0, ..Default::default() });
+        let shared = Shared::default();
+        mix.lock().unwrap().pending_jump = Some(sr * 1.0);
+        let mut buf = vec![0f32; 2 * 480];
+        render(&mix, &shared, &mut buf, 2, |v| v);
+        let m = mix.lock().unwrap();
+        // Jumped back to ~1 s within the first 10 ms block, never ran backwards.
+        assert!(m.pending_jump.is_none());
+        assert!(m.pos > sr * 1.0 && m.pos < sr * 1.01, "pos {}", m.pos / sr);
+        // Volume dipped (fade) somewhere in that block and came back up.
+        let min = buf.iter().step_by(2).cloned().fold(f32::MAX, f32::min);
+        assert!(min < 0.01, "fade should dip near silence");
+        assert!(m.fade > 0.99);
     }
 }
