@@ -365,3 +365,38 @@ mod measure_tests {
         assert_eq!(measure_number(&lines, 4200.0), 4);
     }
 }
+
+/// The grid tick strictly after (`forward`) or strictly before `t` at 1/`div`.
+pub fn adjacent_tick(lines: &[RedLine], t: f64, div: u32, forward: bool) -> f64 {
+    let s = snap(lines, t, div);
+    let step = red_line_at(lines, s).beat_length / div as f64;
+    if forward {
+        if s > t + 0.5 { s } else { snap(lines, s + step, div) }
+    } else if s < t - 0.5 {
+        s
+    } else {
+        // Step back from a tick: use the previous section's spacing if we cross a red line.
+        let prev = s - red_line_at(lines, s - 1.0).beat_length / div as f64;
+        snap(lines, prev, div).min(s - 0.5)
+    }
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    #[test]
+    fn steps_strictly_past_the_current_position() {
+        let lines = vec![RedLine { offset: 1000.0, beat_length: 400.0, meter: 4 }];
+        // On a tick: move a full tick.
+        assert_eq!(adjacent_tick(&lines, 1400.0, 4, false), 1300.0);
+        assert_eq!(adjacent_tick(&lines, 1400.0, 4, true), 1500.0);
+        // Just after a tick (what happens while playing): backward goes to that tick...
+        assert_eq!(adjacent_tick(&lines, 1420.0, 4, false), 1400.0);
+        // ...and from the tick itself, to the one before. Never stuck on the same tick.
+        let a = adjacent_tick(&lines, 1420.0, 4, false);
+        assert!(adjacent_tick(&lines, a, 4, false) < a);
+        // Just before a tick: forward goes to it.
+        assert_eq!(adjacent_tick(&lines, 1390.0, 4, true), 1400.0);
+    }
+}

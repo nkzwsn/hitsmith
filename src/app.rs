@@ -2256,14 +2256,17 @@ impl Work {
 
     fn seek_ticks(&mut self, engine: Option<&Engine>, n: i32) {
         let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
-        let mut t = osu::snap(&self.reds, pos, self.project.divisor);
-        // From between two ticks, the first step lands on the neighbouring tick.
-        let mut steps = n.abs();
-        if (t - pos).abs() > 1.0 && ((n > 0 && t > pos) || (n < 0 && t < pos)) {
-            steps -= 1;
+        let playing = engine.is_some_and(|e| e.is_playing());
+        let forward = n > 0;
+        // While playing, the song has moved on a little since the last jump. Going back,
+        // treat anything within ~half a tick after a tick as "on" that tick, so each notch
+        // really goes back one more tick instead of landing on the same one again.
+        let mut t = pos;
+        if playing && !forward {
+            t -= (self.step_ms(pos) * 0.5).min(150.0);
         }
-        for _ in 0..steps {
-            t = osu::snap(&self.reds, t + n.signum() as f64 * self.step_ms(t), self.project.divisor);
+        for _ in 0..n.abs() {
+            t = osu::adjacent_tick(&self.reds, t, self.project.divisor, forward);
         }
         self.seek(engine, t);
     }
