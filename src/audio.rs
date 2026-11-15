@@ -146,10 +146,14 @@ struct Voice {
     gain: f32,
 }
 
-/// Scrub feel: how fast the head chases its target, how heavy it is, and its top speed.
-const SCRUB_TAU_SECS: f64 = 0.07;
-const SCRUB_INERTIA_SECS: f64 = 0.018;
-const SCRUB_MAX_SPEED: f64 = 10.0;
+/// Scrub feel. Rewinding plays the song backwards at its own speed (so it sounds
+/// like the song in reverse, not a squeal); catching up forward runs at 2x.
+const SCRUB_BACK_SPEED: f64 = 1.0;
+const SCRUB_FORWARD_SPEED: f64 = 2.0;
+/// Ease into the target over this long so the landing is smooth.
+const SCRUB_EASE_SECS: f64 = 0.015;
+/// How quickly the head changes speed (avoids clicks when it reverses).
+const SCRUB_INERTIA_SECS: f64 = 0.008;
 /// Length of the fade around an instant jump, so it doesn't click.
 const JUMP_FADE_SECS: f64 = 0.005;
 
@@ -375,7 +379,7 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
     // moment, while a skipped buffer is an audible stutter.
     let mut guard = mix.lock().unwrap_or_else(|e| e.into_inner());
     let m = &mut *guard;
-    let tau = SCRUB_TAU_SECS * m.sr;
+    let ease = SCRUB_EASE_SECS * m.sr;
     let inertia = 1.0 / (SCRUB_INERTIA_SECS * m.sr);
     let fade_step = (1.0 / (JUMP_FADE_SECS * m.sr)) as f32;
     for frame in out.chunks_mut(channels) {
@@ -398,7 +402,13 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
             // The target keeps running with playback, so the head lands in time with the music.
             *tg += base;
             let dist = *tg - m.pos;
-            let want = (dist / tau).clamp(-SCRUB_MAX_SPEED, SCRUB_MAX_SPEED) + base;
+            // Speeds follow the song's playback rate, so the rewind matches its tempo and pitch.
+            let speed = m.rate.max(0.25);
+            let cruise = if dist < 0.0 { -SCRUB_BACK_SPEED * speed } else { SCRUB_FORWARD_SPEED * speed };
+            // How fast the gap closes at cruise speed, used to ease the last few ms.
+            let closing = (cruise - base).abs().max(1e-6);
+            let k = (dist.abs() / (closing * ease)).min(1.0);
+            let want = base + (cruise - base) * k;
             m.vel += (want - m.vel) * inertia;
             if dist.abs() < 1.5 && (m.vel - base).abs() < 0.02 {
                 m.pos = *tg;
