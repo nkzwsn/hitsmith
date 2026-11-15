@@ -334,3 +334,34 @@ mod tests {
         assert!(!t.contains("256,192,1000"));
     }
 }
+
+/// 1-based bar (measure) number at `t`, counting across timing sections.
+pub fn measure_number(lines: &[RedLine], t: f64) -> i64 {
+    let mut count = 0i64;
+    for (i, rl) in lines.iter().enumerate() {
+        let len = rl.beat_length * rl.meter as f64;
+        let end = lines.get(i + 1).map(|n| n.offset).unwrap_or(f64::INFINITY);
+        if t < end || i + 1 == lines.len() {
+            return count + ((t - rl.offset) / len + 1e-6).floor() as i64 + 1;
+        }
+        // A section shorter than a whole bar still starts a new bar at the next red line.
+        count += ((end - rl.offset) / len - 1e-6).ceil() as i64;
+    }
+    count
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+
+    #[test]
+    fn counts_bars_across_sections() {
+        let lines = vec![RedLine { offset: 0.0, beat_length: 500.0, meter: 4 }, RedLine { offset: 3000.0, beat_length: 400.0, meter: 3 }];
+        assert_eq!(measure_number(&lines, 0.0), 1);
+        assert_eq!(measure_number(&lines, 1999.0), 1);
+        assert_eq!(measure_number(&lines, 2000.0), 2);
+        // 3000 ms = 1.5 bars of 4/4, so the new section starts bar 3.
+        assert_eq!(measure_number(&lines, 3000.0), 3);
+        assert_eq!(measure_number(&lines, 4200.0), 4);
+    }
+}

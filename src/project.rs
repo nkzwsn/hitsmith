@@ -151,6 +151,9 @@ pub struct ProjectEntry {
     pub dir: PathBuf,
     pub modified: SystemTime,
     pub mapset_label: String,
+    /// Mapset background image, for the project card.
+    pub background: Option<PathBuf>,
+    pub hits: usize,
 }
 
 impl ProjectEntry {
@@ -194,11 +197,16 @@ pub fn list_projects(root: &Path) -> Vec<ProjectEntry> {
             let dir = e.path();
             let json = dir.join("project.json");
             let modified = fs::metadata(&json).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-            let mapset_label = load(&json)
-                .ok()
-                .and_then(|p| p.mapset_dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "(unreadable project)".into());
-            ProjectEntry { name: e.file_name().to_string_lossy().into_owned(), dir, modified, mapset_label }
+            let project = load(&json).ok();
+            let meta = project.as_ref().and_then(|p| crate::osu::read_beatmap(&p.mapset_dir.join(&p.osu_file)).ok().map(|b| (p.mapset_dir.clone(), b.meta)));
+            let mapset_label = match (&meta, &project) {
+                (Some((_, m)), _) => format!("{} - {}", m.display_artist(), m.display_title()),
+                (None, Some(p)) => p.mapset_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                (None, None) => "(unreadable project)".into(),
+            };
+            let background = meta.as_ref().filter(|(_, m)| !m.background.is_empty()).map(|(d, m)| d.join(&m.background)).filter(|p| p.is_file());
+            let hits = project.as_ref().map(|p| p.content.tracks.iter().map(|t| t.notes.len()).sum()).unwrap_or(0);
+            ProjectEntry { name: e.file_name().to_string_lossy().into_owned(), dir, modified, mapset_label, background, hits }
         })
         .collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -239,7 +247,7 @@ pub fn create(root: &Path, name: &str, project: &Project) -> Result<ProjectEntry
         bail!("A project with that name already exists.");
     }
     fs::create_dir_all(dir.join("samples"))?;
-    let entry = ProjectEntry { name: name.trim().to_string(), dir, modified: SystemTime::now(), mapset_label: String::new() };
+    let entry = ProjectEntry { name: name.trim().to_string(), dir, modified: SystemTime::now(), mapset_label: String::new(), background: None, hits: 0 };
     save(&entry.json(), project)?;
     Ok(entry)
 }

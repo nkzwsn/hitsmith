@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod export;
+mod icons;
 mod library;
 mod osu;
 mod project;

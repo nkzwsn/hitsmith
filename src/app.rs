@@ -8,16 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Engine, Event as HitEvent, Peaks};
 use crate::export;
+use crate::icons::{self, Icon};
 use crate::library;
 use crate::osu::{self, Meta, RedLine};
 use crate::theme::{self, Palette, ThemeState};
 use crate::project::{self, Content, ControlPoint, Project, ProjectEntry, SampleEntry, SampleRef, Track};
 
-const HEADER_W: f32 = 290.0;
+const HEADER_W: f32 = 300.0;
+const RULER_H: f32 = 20.0;
 const WAVE_H: f32 = 84.0;
 const LANE_H: f32 = 58.0;
-const ROW_H: f32 = 54.0;
-const DIVISORS: [u32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16];
+const ROW_H: f32 = 68.0;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -121,6 +122,8 @@ struct Home {
     name: String,
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
+    /// Card thumbnails, loaded a few per frame so the list appears instantly.
+    thumbs: HashMap<PathBuf, Option<egui::TextureHandle>>,
 }
 
 enum Screen {
@@ -184,6 +187,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         load_system_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // Roomier, rounder defaults than stock egui.
+        cc.egui_ctx.global_style_mut(|st| {
+            st.spacing.item_spacing = vec2(8.0, 6.0);
+            st.spacing.button_padding = vec2(10.0, 5.0);
+            st.spacing.interact_size.y = 26.0;
+            st.spacing.combo_height = 320.0;
+            use egui::{FontFamily::Proportional, FontId, TextStyle};
+            st.text_styles.insert(TextStyle::Body, FontId::new(14.0, Proportional));
+            st.text_styles.insert(TextStyle::Button, FontId::new(14.0, Proportional));
+            st.text_styles.insert(TextStyle::Heading, FontId::new(22.0, Proportional));
+            st.text_styles.insert(TextStyle::Small, FontId::new(11.5, Proportional));
+        });
         let data_dir = data_dir();
         let projects_dir = data_dir.join("projects");
         let _ = std::fs::create_dir_all(&projects_dir);
@@ -236,7 +251,16 @@ impl App {
                 let bpm = if (hi - lo).abs() < 0.01 { format!("{lo:.0} BPM") } else { format!("{lo:.0}-{hi:.0} BPM") };
                 let bg = load_background(ctx, &dir.join(&bm.meta.background));
                 if self.home.name.trim().is_empty() {
-                    self.home.name = osu::sanitize_file_part(bm.meta.title.as_str());
+                    // Suggest a name that isn't taken yet: "Title", "Title (2)", ...
+                    let base = osu::sanitize_file_part(bm.meta.title.as_str());
+                    let base = if base.is_empty() { "New project".to_string() } else { base };
+                    let mut name = base.clone();
+                    let mut n = 2;
+                    while self.projects_dir.join(&name).exists() {
+                        name = format!("{base} ({n})");
+                        n += 1;
+                    }
+                    self.home.name = name;
                 }
                 if let Some(songs) = dir.parent() {
                     self.settings.last_dir = Some(songs.to_path_buf());
@@ -260,57 +284,90 @@ impl App {
 
     fn home_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        egui::Panel::top("home-top").show(ui, |ui| {
-            ui.add_space(6.0);
+        let pal = self.pal;
+
+        // Drag a .osu file anywhere onto the window to start a project.
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if let Some(f) = dropped.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("osu"))) {
+            self.select_beatmap(&ctx, f);
+        } else if !dropped.is_empty() {
+            self.home.error = Some("Drop a .osu file (any difficulty of the mapset).".into());
+        }
+        let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+
+        egui::Panel::top("home-top").frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(18, 10))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(logo) = &self.logo {
-                    ui.image((logo.id(), vec2(28.0, 28.0)));
+                    ui.image((logo.id(), vec2(30.0, 30.0)));
                 }
-                ui.heading("hitsmith");
-                ui.label(egui::RichText::new("hitsounding workstation for osu!").weak());
+                ui.label(egui::RichText::new("hitsmith").size(20.0).strong());
+                ui.label(egui::RichText::new("hitsounding workstation for osu!").color(pal.text_weak));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme_menu(ui, &mut self.settings) {
                         self.theme_changed = true;
                     }
                 });
             });
-            ui.add_space(6.0);
         });
-        egui::Panel::right("home-projects").default_size(380.0).show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading("Projects");
-                if ui.small_button("Refresh").on_hover_text("Refresh").clicked() {
-                    self.refresh_projects();
-                }
-            });
-            ui.add_space(4.0);
-            if self.home.projects.is_empty() {
-                ui.label(egui::RichText::new("No projects yet. Open a beatmap to start one.").weak());
+
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(18, 8))).show(ui, |ui| {
+            if let Some(err) = &self.audio_error {
+                ui.colored_label(pal.warn, err);
             }
+            if let Some(err) = self.home.error.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(pal.danger, err);
+                    if ui.small_button("Dismiss").clicked() {
+                        self.home.error = None;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Projects").size(24.0).strong());
+                ui.label(egui::RichText::new(format!("{}", self.home.projects.len())).color(pal.text_weak));
+            });
+            ui.add_space(8.0);
+
+            // Load at most two thumbnails per frame.
+            let mut loaded = 0;
+            for p in &self.home.projects {
+                if let Some(bg) = &p.background {
+                    if !self.home.thumbs.contains_key(bg) && loaded < 2 {
+                        self.home.thumbs.insert(bg.clone(), load_background(&ctx, bg));
+                        loaded += 1;
+                    }
+                }
+            }
+            if loaded > 0 {
+                ctx.request_repaint();
+            }
+
             let mut open = None;
             let mut delete = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for p in &self.home.projects {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.strong(&p.name);
-                                ui.label(egui::RichText::new(&p.mapset_label).small().weak());
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Delete").clicked() {
-                                    delete = Some(p.dir.clone());
-                                }
-                                if ui.button("Open").clicked() {
-                                    open = Some(p.clone());
-                                }
-                            });
-                        });
-                    });
+            let mut new_clicked = false;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
+                    if new_project_card(ui, &pal).clicked() {
+                        new_clicked = true;
+                    }
+                    for p in &self.home.projects {
+                        let thumb = p.background.as_ref().and_then(|b| self.home.thumbs.get(b)).and_then(|t| t.as_ref());
+                        match project_card(ui, &pal, p, thumb) {
+                            CardAction::Open => open = Some(p.clone()),
+                            CardAction::Delete => delete = Some(p.dir.clone()),
+                            CardAction::None => {}
+                        }
+                    }
+                });
+                if self.home.projects.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Your projects will show up here.").color(pal.text_weak));
                 }
             });
+            if new_clicked {
+                self.pick_beatmap(&ctx);
+            }
             if let Some(p) = open {
                 self.open_project(&ctx, p);
             }
@@ -318,64 +375,62 @@ impl App {
                 self.home.confirm_delete = delete;
             }
         });
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui.add_space(8.0);
-            if let Some(err) = &self.audio_error {
-                ui.colored_label(self.pal.warn, err);
-            }
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Open beatmap...").size(16.0)).min_size(vec2(180.0, 34.0))).clicked() {
-                    self.pick_beatmap(&ctx);
-                }
-                ui.label(egui::RichText::new("Pick any difficulty (.osu) of the mapset. Its timing is used for the grid.").weak());
-            });
-            ui.add_space(10.0);
-            if let Some(err) = &self.home.error {
-                ui.colored_label(self.pal.danger, err);
-            }
-            let mut switch_to = None;
+
+        if hovering_files {
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop-overlay")));
+            painter.rect_filled(screen, 0.0, pal.bg.gamma_multiply(0.85));
+            let r = screen.shrink(40.0);
+            painter.rect_stroke(r, CornerRadius::same(18), Stroke::new(2.0, pal.accent), StrokeKind::Inside);
+            painter.text(r.center(), Align2::CENTER_CENTER, "Drop a .osu file to start a project", FontId::proportional(22.0), pal.text);
+        }
+
+        // New-project dialog: one step from a picked beatmap to a project.
+        if self.home.picked.is_some() {
+            let mut close = false;
             let mut create = false;
-            if let Some(p) = &self.home.picked {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    if let Some(tex) = &p.bg {
-                        let size = tex.size_vec2();
-                        let mut w = ui.available_width().min(640.0);
-                        let mut h = w * size.y / size.x;
-                        if h > 220.0 {
-                            h = 220.0;
-                            w = h * size.x / size.y;
-                        }
-                        ui.image((tex.id(), vec2(w, h)));
-                    }
-                    ui.heading(format!("{} - {}", p.meta.display_artist(), p.meta.display_title()));
-                    ui.label(format!("Mapped by {}  ·  {}", p.meta.creator, p.bpm));
-                    ui.label(egui::RichText::new(p.dir.display().to_string()).small().weak());
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Timing from");
-                        egui::ComboBox::from_id_salt("diff").width(360.0).selected_text(&p.osu_file).show_ui(ui, |ui| {
-                            for d in &p.diffs {
-                                if ui.selectable_label(*d == p.osu_file, d).clicked() {
-                                    switch_to = Some(p.dir.join(d));
-                                }
+            let mut switch_to = None;
+            egui::Modal::new(egui::Id::unique("new-project")).show(&ctx, |ui| {
+                let p = self.home.picked.as_ref().unwrap();
+                ui.set_width(520.0);
+                if let Some(tex) = &p.bg {
+                    let (rect, _) = ui.allocate_exact_size(vec2(520.0, 150.0), Sense::hover());
+                    paint_cover(ui, rect, tex, CornerRadius::same(10));
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(p.meta.display_title()).size(20.0).strong());
+                ui.label(egui::RichText::new(format!("{}  ·  mapped by {}  ·  {}", p.meta.display_artist(), p.meta.creator, p.bpm)).color(pal.text_weak));
+                ui.add_space(10.0);
+                egui::Grid::new("new-project-grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Timing from");
+                    egui::ComboBox::from_id_salt("diff").width(380.0).selected_text(&p.osu_file).show_ui(ui, |ui| {
+                        for d in &p.diffs {
+                            if ui.selectable_label(*d == p.osu_file, d).clicked() {
+                                switch_to = Some(p.dir.join(d));
                             }
-                        });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Project name");
-                        let r = ui.add(egui::TextEdit::singleline(&mut self.home.name).desired_width(260.0));
-                        if (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) || ui.button("Create project").clicked() {
-                            create = true;
                         }
                     });
+                    ui.end_row();
+                    ui.label("Project name");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.home.name).desired_width(380.0));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        create = true;
+                    }
+                    ui.end_row();
                 });
-            } else {
-                ui.add_space(30.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No beatmap selected").size(18.0).weak());
+                if let Some(err) = &self.home.error {
+                    ui.colored_label(pal.danger, err);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if icons::primary(ui, &pal, Icon::Plus, "Create project").clicked() {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
                 });
-            }
+            });
             if let Some(f) = switch_to {
                 self.select_beatmap(&ctx, &f);
             }
@@ -388,13 +443,19 @@ impl App {
                 match project::create(&self.projects_dir, &self.home.name, &proj) {
                     Ok(entry) => {
                         self.home.name.clear();
+                        self.home.picked = None;
+                        self.home.error = None;
                         self.refresh_projects();
                         self.open_project(&ctx, entry);
                     }
                     Err(e) => self.home.error = Some(format!("{e:#}")),
                 }
+            } else if close || ui.input(|i| i.key_pressed(Key::Escape)) {
+                self.home.picked = None;
+                self.home.name.clear();
+                self.home.error = None;
             }
-        });
+        }
 
         if let Some(dir) = self.home.confirm_delete.clone() {
             let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -402,8 +463,9 @@ impl App {
             egui::Modal::new(egui::Id::unique("confirm-delete")).show(&ctx, |ui| {
                 ui.heading("Delete project?");
                 ui.label(format!("\"{name}\" and its imported samples will be moved to the Recycle Bin, so you can restore it from there. Exported difficulties in the mapset stay."));
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
+                    if ui.button(egui::RichText::new("Move to Recycle Bin").color(pal.danger)).clicked() {
                         if dir.parent() == Some(self.projects_dir.as_path()) && dir.join("project.json").is_file() {
                             if let Err(e) = project::move_to_recycle_bin(&dir) {
                                 self.home.error = Some(format!("Couldn't delete: {e:#}"));
@@ -422,6 +484,93 @@ impl App {
             }
         }
     }
+
+}
+
+enum CardAction {
+    None,
+    Open,
+    Delete,
+}
+
+const CARD: Vec2 = vec2(250.0, 210.0);
+
+/// Draw a texture so it covers `rect` (cropping the overflow), with rounded corners.
+fn paint_cover(ui: &mut egui::Ui, rect: Rect, tex: &egui::TextureHandle, radius: CornerRadius) {
+    let size = tex.size_vec2();
+    let (ta, ra) = (size.x / size.y, rect.width() / rect.height());
+    let uv = if ta > ra {
+        let w = ra / ta;
+        Rect::from_min_max(pos2((1.0 - w) / 2.0, 0.0), pos2((1.0 + w) / 2.0, 1.0))
+    } else {
+        let h = ta / ra;
+        Rect::from_min_max(pos2(0.0, (1.0 - h) / 2.0), pos2(1.0, (1.0 + h) / 2.0))
+    };
+    ui.put(rect, egui::Image::new((tex.id(), rect.size())).uv(uv).corner_radius(radius));
+}
+
+fn ago(t: std::time::SystemTime) -> String {
+    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+fn new_project_card(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(CARD, Sense::click());
+    let hover = resp.hovered();
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(14), if hover { pal.accent.gamma_multiply(0.12) } else { pal.panel });
+    painter.rect_stroke(rect, CornerRadius::same(14), Stroke::new(if hover { 2.0 } else { 1.5 }, if hover { pal.accent } else { pal.border }), StrokeKind::Inside);
+    let c = rect.center() - vec2(0.0, 22.0);
+    painter.circle_filled(c, 26.0, pal.accent);
+    icons::paint(painter, Rect::from_center_size(c, Vec2::splat(24.0)), Icon::Plus, pal.bg);
+    painter.text(c + vec2(0.0, 46.0), Align2::CENTER_CENTER, "New project", FontId::proportional(16.0), pal.text);
+    painter.text(c + vec2(0.0, 68.0), Align2::CENTER_CENTER, "Open a .osu, or drop one here", FontId::proportional(12.0), pal.text_weak);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn project_card(ui: &mut egui::Ui, pal: &Palette, p: &ProjectEntry, thumb: Option<&egui::TextureHandle>) -> CardAction {
+    let (rect, resp) = ui.allocate_exact_size(CARD, Sense::click());
+    let hover = resp.hovered();
+    let lift = if hover { -2.0 } else { 0.0 };
+    let rect = rect.translate(vec2(0.0, lift));
+    ui.painter().rect_filled(rect, CornerRadius::same(14), pal.panel);
+    let img = Rect::from_min_size(rect.min, vec2(rect.width(), 118.0));
+    match thumb {
+        Some(t) => paint_cover(ui, img, t, CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }),
+        None => {
+            ui.painter().rect_filled(img, CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }, pal.lane);
+            icons::paint(ui.painter(), Rect::from_center_size(img.center(), Vec2::splat(36.0)), Icon::Music, pal.text_weak);
+        }
+    }
+    let painter = ui.painter();
+    let x = rect.left() + 14.0;
+    let clip = Rect::from_min_max(pos2(x, img.bottom()), pos2(rect.right() - 10.0, rect.bottom()));
+    let tp = painter.with_clip_rect(clip);
+    tp.text(pos2(x, img.bottom() + 12.0), Align2::LEFT_TOP, &p.name, FontId::proportional(16.0), pal.text);
+    tp.text(pos2(x, img.bottom() + 36.0), Align2::LEFT_TOP, &p.mapset_label, FontId::proportional(12.0), pal.text_weak);
+    tp.text(pos2(x, rect.bottom() - 14.0), Align2::LEFT_BOTTOM, format!("{} hits  ·  edited {}", p.hits, ago(p.modified)), FontId::proportional(11.5), pal.text_weak);
+    painter.rect_stroke(rect, CornerRadius::same(14), Stroke::new(if hover { 2.0 } else { 1.0 }, if hover { pal.accent } else { pal.border }), StrokeKind::Inside);
+
+    // Delete button, shown on hover in the image corner.
+    let del = Rect::from_min_size(pos2(rect.right() - 38.0, rect.top() + 8.0), Vec2::splat(30.0));
+    let del_resp = ui.interact(del, ui.scope_id().with(("del", &p.dir)), Sense::click());
+    if hover || del_resp.hovered() {
+        let bg = if del_resp.hovered() { pal.danger } else { Color32::from_black_alpha(150) };
+        ui.painter().rect_filled(del, CornerRadius::same(8), bg);
+        icons::paint(ui.painter(), del.shrink(7.0), Icon::Trash, Color32::WHITE);
+    }
+    if del_resp.clicked() {
+        return CardAction::Delete;
+    }
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        return CardAction::Open;
+    }
+    CardAction::None
 }
 
 fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
@@ -568,6 +717,10 @@ struct Work {
     row_rects: Vec<(usize, Rect)>,
     show_keys: bool,
     confirm_clear: bool,
+    toast: Option<(String, Instant)>,
+    renaming: Option<(u64, String)>,
+    pos_now: f64,
+    playing_now: bool,
 }
 
 impl Work {
@@ -622,6 +775,10 @@ impl Work {
             row_rects: Vec::new(),
             show_keys: false,
             confirm_clear: false,
+            toast: None,
+            renaming: None,
+            pos_now: 0.0,
+            playing_now: false,
         };
         if let Some(e) = engine {
             e.set_song(Arc::new(Vec::new()));
@@ -774,6 +931,8 @@ impl Work {
         }
         let playing = engine.map(|e| e.is_playing()).unwrap_or(false);
         let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        self.pos_now = pos;
+        self.playing_now = playing;
         if playing {
             ctx.request_repaint();
         }
@@ -785,117 +944,169 @@ impl Work {
             go_home = true;
         }
 
-        egui::Panel::top("work-top").show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("< Projects").on_hover_text("Save and go back").clicked() {
+        let pal = self.pal;
+        egui::Panel::top("work-top").frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 4 })).show(ui, |ui| {
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+            // Left: back + song.
+            {
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                if icons::button(ui, &pal, Icon::Back, "Save and go back to projects (Esc)", false, true).clicked() {
                     go_home = true;
                 }
-                ui.separator();
-                let play_label = if playing { "Pause" } else { "Play" };
-                if ui.add_enabled(engine.is_some() && self.song.is_some(), egui::Button::new(play_label).min_size(vec2(58.0, 0.0))).on_hover_text("Space").clicked() {
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(self.meta.display_title()).size(15.0).strong());
+                    ui.label(egui::RichText::new(format!("{}  ·  {}", self.meta.display_artist(), self.entry.name)).size(12.0).color(pal.text_weak));
+                });
+            }
+            // Centre: transport.
+            {
+                let center = Rect::from_center_size(row.center(), vec2(300.0, row.height()));
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(center).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                if icons::button(ui, &pal, Icon::Stop, "Stop and go to start (Home)", false, engine.is_some()).clicked() {
+                    if let Some(e) = engine {
+                        e.play(false);
+                    }
+                    self.seek(engine, 0.0);
+                }
+                if icons::play_button(ui, &pal, playing, engine.is_some() && self.song.is_some()).clicked() {
                     if let Some(e) = engine {
                         e.play(!playing);
                     }
                 }
-                if ui.button("Stop").on_hover_text("Stop and go to start (Home)").clicked() {
-                    if let Some(e) = engine {
-                        e.play(false);
-                        e.seek_ms(0.0);
-                    }
-                    self.view_start = -500.0;
-                }
-                ui.label(egui::RichText::new(fmt_time(pos)).monospace().size(16.0));
-                ui.label(format!("{:.0} BPM", osu::red_line_at(&self.reds, pos).bpm()));
-                ui.separator();
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
-                    self.undo(engine);
-                }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Redo (Ctrl+Y)").clicked() {
-                    self.redo(engine);
-                }
-                ui.separator();
-                if ui.selectable_label(self.tool == Tool::Select, "Select").on_hover_text("Select and move hits (1)").clicked() {
-                    self.tool = Tool::Select;
-                }
-                if ui.selectable_label(self.tool == Tool::Place, "Place").on_hover_text("Click the grid to place hits (2)").clicked() {
-                    self.tool = Tool::Place;
-                }
-                ui.separator();
-                egui::ComboBox::from_id_salt("div").width(60.0).selected_text(format!("1/{}", self.project.divisor)).show_ui(ui, |ui| {
-                    for d in DIVISORS {
-                        if ui.selectable_label(self.project.divisor == d, format!("1/{d}")).clicked() {
-                            self.project.divisor = d;
-                            self.dirty = true;
-                        }
-                    }
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(fmt_time(pos)).monospace().size(18.0).strong());
+                    let bpm = osu::red_line_at(&self.reds, pos).bpm();
+                    let speed = if (self.speed - 1.0).abs() > 0.001 { format!("  ·  {:.0}% speed", self.speed * 100.0) } else { String::new() };
+                    ui.label(egui::RichText::new(format!("{bpm:.0} BPM{speed}")).size(11.5).color(pal.text_weak));
                 });
-                ui.toggle_value(&mut self.follow, "Follow").on_hover_text("Keep the playhead in view while playing");
-                ui.separator();
-                ui.spacing_mut().slider_width = 70.0;
-                ui.label("Song");
-                ui.add(egui::Slider::new(&mut vols.0, 0.0..=1.0).show_value(false)).on_hover_text("Song volume");
-                ui.label("Hits");
-                ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme_ui(ui);
-                    if ui.button("Keys").on_hover_text("Keyboard shortcuts (osu! editor style)").clicked() {
-                        self.show_keys = !self.show_keys;
-                    }
-                    if ui.button("Export…").clicked() {
-                        self.export_open = true;
-                        self.export_result = None;
-                    }
-                    if ui.button("+ Track").clicked() {
-                        self.add_track(engine);
-                    }
-                    if ui.button("Import sample…").on_hover_text("Copy a .wav/.ogg/.mp3 into this project").clicked() {
+            }
+            // Right: export + more.
+            {
+                let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+                if icons::primary(ui, &pal, Icon::Export, "Export").clicked() {
+                    self.export_open = true;
+                    self.export_result = None;
+                }
+                ui.menu_button(egui::RichText::new("More").size(14.0), |ui| {
+                    ui.set_min_width(220.0);
+                    if ui.button("Import sample…").on_hover_text("Copy .wav/.ogg/.mp3 files into this project").clicked() {
                         if let Some(files) = rfd::FileDialog::new().add_filter("Audio", &project::AUDIO_EXTS).pick_files() {
+                            let n = files.len();
                             for f in files {
                                 if let Err(e) = project::import_sample(&self.entry.samples_dir(), &f) {
                                     self.save_error = Some(format!("{e:#}"));
                                 }
                             }
                             self.refresh_library();
+                            self.toast(format!("Imported {n} sample{}", if n == 1 { "" } else { "s" }));
+                        }
+                    }
+                    if ui.button("Keyboard shortcuts").clicked() {
+                        self.show_keys = true;
+                    }
+                    if ui.button("Open mapset folder").clicked() {
+                        let _ = std::process::Command::new("explorer").arg(&self.project.mapset_dir).spawn();
+                    }
+                    if ui.button(egui::RichText::new("Remove all hits…").color(pal.danger)).clicked() {
+                        self.confirm_clear = true;
+                    }
+                });
+                theme_ui(ui);
+            }
+        });
+
+        // Tool strip.
+        egui::Panel::top("work-tools").frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 12, right: 12, top: 2, bottom: 8 })).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                icons::group(ui, &pal, |ui| {
+                    if icons::button(ui, &pal, Icon::Cursor, "Select tool (1): click or drag a box to select hits", self.tool == Tool::Select, true).clicked() {
+                        self.tool = Tool::Select;
+                    }
+                    if icons::button(ui, &pal, Icon::Pencil, "Place tool (2): click the grid to place hits", self.tool == Tool::Place, true).clicked() {
+                        self.tool = Tool::Place;
+                    }
+                });
+                ui.add_space(6.0);
+                icons::group(ui, &pal, |ui| {
+                    ui.label(egui::RichText::new("Snap").size(12.0).color(pal.text_weak));
+                    let mut shown: Vec<u32> = vec![1, 2, 3, 4, 6, 8, 12, 16];
+                    if !shown.contains(&self.project.divisor) {
+                        shown.push(self.project.divisor);
+                        shown.sort_unstable();
+                    }
+                    for d in shown {
+                        if icons::chip(ui, &pal, &format!("1/{d}"), self.project.divisor == d, "Ctrl+wheel or Shift+1..9").clicked() {
+                            self.project.divisor = d;
+                            self.dirty = true;
                         }
                     }
                 });
+                ui.add_space(6.0);
+                icons::group(ui, &pal, |ui| {
+                    if icons::button(ui, &pal, Icon::Undo, "Undo (Ctrl+Z)", false, !self.undo.is_empty()).clicked() {
+                        self.undo(engine);
+                    }
+                    if icons::button(ui, &pal, Icon::Redo, "Redo (Ctrl+Y)", false, !self.redo.is_empty()).clicked() {
+                        self.redo(engine);
+                    }
+                    if icons::button(ui, &pal, Icon::Follow, "Follow the playhead while playing", self.follow, true).clicked() {
+                        self.follow = !self.follow;
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().slider_width = 80.0;
+                    icons::group(ui, &pal, |ui| {
+                        let mut z = self.project.zoom;
+                        if ui.add(egui::Slider::new(&mut z, 0.02..=2.0).logarithmic(true).show_value(false)).on_hover_text("Zoom (Alt+wheel)").changed() {
+                            self.project.zoom = z;
+                            self.dirty = true;
+                        }
+                        ui.label(egui::RichText::new("Zoom").size(12.0).color(pal.text_weak));
+                    });
+                    icons::group(ui, &pal, |ui| {
+                        ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume");
+                        ui.label(egui::RichText::new("Hits").size(12.0).color(pal.text_weak));
+                    });
+                    icons::group(ui, &pal, |ui| {
+                        ui.add(egui::Slider::new(&mut vols.0, 0.0..=1.0).show_value(false)).on_hover_text("Song volume");
+                        ui.label(egui::RichText::new("Song").size(12.0).color(pal.text_weak));
+                    });
+                });
             });
-            ui.add_space(4.0);
         });
 
-        egui::Panel::bottom("work-bottom").show(ui, |ui| {
+        egui::Panel::bottom("work-bottom").frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(12, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let total = self.duration();
-                ui.spacing_mut().slider_width = (ui.available_width() - 330.0).max(100.0);
+                ui.spacing_mut().slider_width = (ui.available_width() - 360.0).max(100.0);
                 let mut v = self.view_start;
                 if ui.add(egui::Slider::new(&mut v, -2000.0..=total).show_value(false)).on_hover_text("Scroll the timeline").changed() {
                     self.view_start = v;
                     self.follow = false;
                 }
-                let speed_text = format!("Speed {:.0}%", self.speed * 100.0);
-                if ui.add(egui::Button::new(speed_text).frame(false)).on_hover_text("Ctrl+Up/Down: 25% steps, Ctrl+Shift+Up/Down: 5%. Click to reset.").clicked() {
+                let sel = self.selected.len();
+                let info = if sel > 0 { format!("{sel} selected") } else { format!("{} hits", self.project.content.tracks.iter().map(|t| t.notes.len()).sum::<usize>()) };
+                ui.label(egui::RichText::new(info).size(12.0).color(pal.text_weak));
+                let speed_text = format!("{:.0}% speed", self.speed * 100.0);
+                if ui.add(egui::Button::new(egui::RichText::new(speed_text).size(12.0)).frame(false)).on_hover_text("Ctrl+Up/Down: 25% steps, Ctrl+Shift+Up/Down: 5%. Click to reset.").clicked() {
                     self.set_speed(1.0, engine);
                 }
-                ui.label("Zoom");
-                let mut z = self.project.zoom;
-                ui.spacing_mut().slider_width = 120.0;
-                if ui.add(egui::Slider::new(&mut z, 0.02..=2.0).logarithmic(true).show_value(false)).on_hover_text("Alt + mouse wheel also zooms").changed() {
-                    self.project.zoom = z;
-                    self.dirty = true;
-                }
                 let status = if let Some(e) = &self.save_error {
-                    egui::RichText::new(e).color(self.pal.danger)
+                    egui::RichText::new(e).color(pal.danger)
                 } else if self.dirty {
-                    egui::RichText::new("Saving…").weak()
+                    egui::RichText::new("Saving…").color(pal.text_weak)
                 } else {
-                    egui::RichText::new("Saved").weak()
+                    egui::RichText::new("Saved").color(pal.text_weak)
                 };
-                ui.label(status);
+                ui.label(status.size(12.0));
             });
         });
 
-        egui::CentralPanel::default_margins().show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 12, right: 12, top: 4, bottom: 4 })).show(ui, |ui| {
             if let Some(e) = &self.song_error {
                 ui.colored_label(self.pal.danger, format!("Couldn't load the song: {e}"));
             } else if self.song.is_none() {
@@ -968,14 +1179,19 @@ impl Work {
                 }
             }
 
+            // Ruler with bar numbers.
+            let (_, rect, resp) = lane_row(ui, "ruler", RULER_H, timeline_left, lane_right);
+            self.ruler(ui, rect, &resp, pos, engine);
+
             // Waveform row.
             let (header, rect, resp) = lane_row(ui, "wave", WAVE_H, timeline_left, lane_right);
             {
                 let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(header));
                 ui.shrink_clip_rect(header);
-                ui.label(egui::RichText::new(&self.meta.title).strong());
-                ui.label(egui::RichText::new(format!("{} · {}", self.meta.artist, self.project.osu_file)).small().weak());
-                ui.label(egui::RichText::new("Click to seek · drag to scroll").small().weak());
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Song").size(13.0).strong());
+                ui.label(egui::RichText::new(&self.project.osu_file).size(11.5).color(pal.text_weak));
+                ui.label(egui::RichText::new(format!("{} bookmarks", self.project.bookmarks.len())).size(11.5).color(pal.text_weak));
             }
             self.wave_lane(ui, rect, &resp, pos, engine);
             ui.add_space(4.0);
@@ -985,8 +1201,12 @@ impl Work {
             {
                 let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(header));
                 ui.shrink_clip_rect(header);
-                ui.label(egui::RichText::new(format!("Volume  {}%", self.project.volume_at(pos as i64))).strong());
-                ui.label(egui::RichText::new("Click: add point · drag: move/volume · right-click: delete").small().weak());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Volume").size(13.0).strong());
+                    ui.label(egui::RichText::new(format!("{}%", self.project.volume_at(pos as i64))).size(13.0).color(pal.accent));
+                });
+                ui.label(egui::RichText::new("Click to add a point, drag to change it").size(11.5).color(pal.text_weak));
             }
             self.volume_lane(ui, rect, &resp, pos, engine);
             ui.add_space(6.0);
@@ -995,10 +1215,10 @@ impl Work {
             if self.project.content.tracks.is_empty() {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No tracks yet").size(18.0));
-                    ui.label(egui::RichText::new("Add a track, pick its sample, then click the grid to place hits.").weak());
-                    ui.add_space(8.0);
-                    if ui.button("+ Add track").clicked() {
+                    ui.label(egui::RichText::new("No tracks yet").size(18.0).strong());
+                    ui.label(egui::RichText::new("A track is one hitsound sample. Add one, then click the grid to place hits.").color(pal.text_weak));
+                    ui.add_space(10.0);
+                    if icons::primary(ui, &pal, Icon::Plus, "Add track").clicked() {
                         self.add_track(engine);
                     }
                     if self.library.is_empty() {
@@ -1024,6 +1244,12 @@ impl Work {
                     ui.add_space(2.0);
                 }
                 self.row_rects = rects;
+                if count > 0 {
+                    ui.add_space(4.0);
+                    if ui.add(egui::Button::new(egui::RichText::new("+  Add track").color(pal.text_weak)).frame(false)).clicked() {
+                        self.add_track(engine);
+                    }
+                }
             });
         });
 
@@ -1052,6 +1278,7 @@ impl Work {
             }
         }
 
+        self.draw_toast(&ctx);
         if self.show_keys {
             let mut open = true;
             egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).default_width(460.0).show(&ctx, |ui| {
@@ -1153,50 +1380,114 @@ impl Work {
     }
 
     fn track_header(&mut self, ui: &mut egui::Ui, ti: usize, engine: Option<&Engine>) {
+        let pal = self.pal;
+        let library = self.library.clone();
+        let full = ui.max_rect();
         let mut edited = false;
         let mut audition = None;
         let mut remove = false;
-        let library = self.library.clone();
+        let pos = self.pos_now;
+        let playing = self.playing_now;
+        let renaming = self.renaming.clone();
         let t = &mut self.project.content.tracks[ti];
-        let color = self.pal.tracks[t.color as usize % 8];
-        let (bar, _) = ui.allocate_exact_size(vec2(4.0, ROW_H - 6.0), Sense::hover());
-        ui.painter().rect_filled(bar, 2.0, color);
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut t.name).desired_width(104.0));
-                if ui.selectable_label(t.muted, "M").on_hover_text("Mute").clicked() {
-                    t.muted = !t.muted;
-                    edited = true;
+        let color = pal.tracks[t.color as usize % 8];
+
+        // Card background and colour bar that pulses when this track plays a hit.
+        let card = full.shrink2(vec2(0.0, 2.0));
+        ui.painter().rect_filled(card, CornerRadius::same(8), pal.panel);
+        let lit = playing && t.notes.iter().rev().find(|&&n| (n as f64) <= pos).is_some_and(|&n| pos - (n as f64) < 120.0);
+        let bar = Rect::from_min_size(card.min, vec2(if lit { 7.0 } else { 4.0 }, card.height()));
+        ui.painter().rect_filled(bar, CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, if lit { color.lerp_to_gamma(Color32::WHITE, 0.35) } else { color });
+
+        let inner = card.shrink2(vec2(12.0, 5.0)).translate(vec2(4.0, 0.0));
+        let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)));
+        ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
+        let mut commit_rename = None;
+        ui.horizontal(|ui| {
+            ui.set_height(24.0);
+            match &renaming {
+                Some((id, buf)) if *id == t.id => {
+                    let mut b = buf.clone();
+                    let r = ui.add(egui::TextEdit::singleline(&mut b).desired_width(130.0));
+                    r.request_focus();
+                    if r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        commit_rename = Some(Some(b.clone()));
+                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        commit_rename = Some(None);
+                    } else {
+                        commit_rename = Some(Some(format!("\u{0}{b}")));
+                    }
                 }
-                if ui.selectable_label(t.solo, "S").on_hover_text("Solo").clicked() {
+                _ => {
+                    let name = egui::Label::new(egui::RichText::new(&t.name).size(13.5).strong()).truncate().sense(Sense::click());
+                    let r = ui.scope(|ui| {
+                        ui.set_max_width(130.0);
+                        ui.add(name)
+                    }).inner.on_hover_text("Double-click to rename");
+                    if r.double_clicked() {
+                        commit_rename = Some(Some(format!("\u{0}{}", t.name)));
+                    }
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if icons::button(ui, &pal, Icon::Trash, "Remove track", false, true).clicked() {
+                    remove = true;
+                }
+                if icons::button(ui, &pal, Icon::Play, "Preview sample", false, t.sample.is_some()).clicked() {
+                    audition = t.sample.clone().map(|s| (s, t.volume));
+                }
+                if icons::button(ui, &pal, Icon::Headphones, "Solo", t.solo, true).clicked() {
                     t.solo = !t.solo;
                     edited = true;
                 }
-                if ui.small_button("Play").on_hover_text("Preview sample").clicked() {
-                    audition = t.sample.clone().map(|s| (s, t.volume));
-                }
-                if ui.small_button("X").on_hover_text("Remove track").clicked() {
-                    remove = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "(no sample)".into());
-                egui::ComboBox::from_id_salt(("sample", t.id)).width(160.0).selected_text(label).show_ui(ui, |ui| {
-                    for e in &library {
-                        let sel = t.sample.as_ref() == Some(&e.r);
-                        if ui.selectable_label(sel, format!("{}  ·  {}", e.r.file, e.r.source.label())).clicked() && !sel {
-                            t.sample = Some(e.r.clone());
-                            edited = true;
-                            audition = Some((e.r.clone(), t.volume));
-                        }
-                    }
-                });
-                let r = ui.add(egui::DragValue::new(&mut t.volume).range(0..=100).suffix("%")).on_hover_text("Track volume");
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                if icons::button(ui, &pal, if t.muted { Icon::SpeakerOff } else { Icon::Speaker }, "Mute", t.muted, true).clicked() {
+                    t.muted = !t.muted;
                     edited = true;
                 }
             });
         });
+        ui.horizontal(|ui| {
+            let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sample".into());
+            egui::ComboBox::from_id_salt(("sample", t.id)).width(160.0).selected_text(egui::RichText::new(label).size(12.5)).show_ui(ui, |ui| {
+                let mut last = None;
+                for e in &library {
+                    if last != Some(e.r.source) {
+                        ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
+                        last = Some(e.r.source);
+                    }
+                    let sel = t.sample.as_ref() == Some(&e.r);
+                    if ui.selectable_label(sel, &e.r.file).clicked() && !sel {
+                        t.sample = Some(e.r.clone());
+                        edited = true;
+                        audition = Some((e.r.clone(), t.volume));
+                    }
+                }
+            });
+            ui.spacing_mut().slider_width = 56.0;
+            let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Track volume");
+            ui.label(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak));
+            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                edited = true;
+            }
+        });
+        match commit_rename {
+            Some(Some(b)) if b.starts_with('\u{0}') => {
+                let id = t.id;
+                self.renaming = Some((id, b[1..].to_string()));
+            }
+            Some(Some(b)) => {
+                let b = b.trim().to_string();
+                if !b.is_empty() && b != self.project.content.tracks[ti].name {
+                    self.checkpoint();
+                    self.project.content.tracks[ti].name = b;
+                    edited = true;
+                }
+                self.renaming = None;
+            }
+            Some(None) => self.renaming = None,
+            None => {}
+        }
         if edited {
             self.dirty = true;
             self.last_edit = Instant::now();
@@ -1213,6 +1504,42 @@ impl Work {
                     }
                 }
             }
+        }
+    }
+
+    fn ruler(&mut self, ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
+        let painter = ui.painter_at(rect);
+        let t0 = self.t_of(rect, rect.left());
+        let t1 = self.t_of(rect, rect.right());
+        let mut last_label = f32::MIN;
+        osu::grid_lines(&self.reds, t0, t1, 1, |t, _, measure| {
+            let x = self.x_of(rect, t);
+            if measure {
+                painter.vline(x, rect.y_range(), Stroke::new(1.0, self.pal.grid_measure));
+                if x - last_label > 34.0 {
+                    let bar = osu::measure_number(&self.reds, t);
+                    painter.text(pos2(x + 4.0, rect.center().y), Align2::LEFT_CENTER, format!("{bar}"), FontId::proportional(11.0), self.pal.text_weak);
+                    last_label = x;
+                }
+            } else {
+                painter.vline(x, (rect.bottom() - 5.0)..=rect.bottom(), Stroke::new(1.0, self.pal.grid_beat));
+            }
+        });
+        let x = self.x_of(rect, pos);
+        if rect.x_range().contains(x) {
+            let tri = vec![pos2(x - 6.0, rect.top() + 4.0), pos2(x + 6.0, rect.top() + 4.0), pos2(x, rect.bottom())];
+            painter.add(egui::Shape::convex_polygon(tri, self.pal.playhead, Stroke::NONE));
+        }
+        if resp.clicked() || resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = self.t_of(rect, p.x).max(0.0);
+                if let Some(e) = engine {
+                    e.seek_ms(t);
+                }
+            }
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
 
@@ -1425,6 +1752,8 @@ impl Work {
         let h = rect.height() - 14.0;
         let notes = &track.notes;
         let start = notes.partition_point(|&n| n < t0 - delta.abs());
+        let hover_x = resp.hover_pos().map(|p| p.x);
+        let playing = self.playing_now;
         for &n in &notes[start..] {
             if n > t1 + delta.abs() {
                 break;
@@ -1432,12 +1761,22 @@ impl Work {
             let sel = self.selected.contains(&(tid, n));
             let shown = if sel { n + delta } else { n };
             let x = self.x_of(rect, shown as f64);
-            let r = Rect::from_center_size(pos2(x, rect.center().y), vec2(if sel { 11.0 } else { 9.0 }, h));
-            painter.rect_filled(r, CornerRadius::same(3), fillc);
+            let hovered = self.drag.is_none() && hover_x.is_some_and(|hx| (hx - x).abs() < 7.0);
+            // Flash for ~180 ms after the playhead passes a hit.
+            let since = pos - n as f64;
+            if playing && (0.0..180.0).contains(&since) {
+                let k = 1.0 - (since / 180.0) as f32;
+                let glow = Rect::from_center_size(pos2(x, rect.center().y), vec2(10.0 + 18.0 * k, h + 6.0 * k));
+                painter.rect_filled(glow, CornerRadius::same(8), color.gamma_multiply(0.45 * k));
+            }
+            let w = if sel || hovered { 12.0 } else { 10.0 };
+            let r = Rect::from_center_size(pos2(x, rect.center().y), vec2(w, h));
+            let fill = if hovered { fillc.lerp_to_gamma(Color32::WHITE, 0.25) } else { fillc };
+            painter.rect_filled(r, CornerRadius::same(5), fill);
             if sel {
-                painter.rect_stroke(r.expand(1.5), CornerRadius::same(4), Stroke::new(2.0, self.pal.text), StrokeKind::Outside);
+                painter.rect_stroke(r.expand(2.0), CornerRadius::same(7), Stroke::new(2.0, self.pal.text), StrokeKind::Outside);
             } else {
-                painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_black_alpha(120)), StrokeKind::Inside);
+                painter.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, Color32::from_black_alpha(90)), StrokeKind::Inside);
             }
         }
         // Rubber band.
@@ -1553,7 +1892,17 @@ impl Work {
                 }
             }
         }
-        if resp.hovered() && self.drag.is_none() {
+        if resp.hovered() || resp.dragged() {
+            let over_hit = resp.hover_pos().is_some_and(|p| near(self, p).is_some());
+            let cursor = match (&self.drag, self.tool) {
+                (Some(Drag::Notes { .. }), _) => egui::CursorIcon::Grabbing,
+                _ if over_hit => egui::CursorIcon::Grab,
+                (_, Tool::Place) => egui::CursorIcon::Crosshair,
+                _ => egui::CursorIcon::Default,
+            };
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if resp.hovered() && self.drag.is_none() && self.project.content.tracks[ti].sample.is_none() {
             let hint = if self.project.content.tracks[ti].sample.is_none() {
                 "Pick a sample for this track first"
             } else if self.tool == Tool::Place {
@@ -1698,6 +2047,7 @@ impl Work {
             if let Some(i) = near {
                 self.project.bookmarks.remove(i);
                 self.dirty = true;
+                self.toast("Bookmark removed");
             }
         }
         if k(cmd, Key::B) {
@@ -1705,6 +2055,7 @@ impl Work {
             if let Err(i) = self.project.bookmarks.binary_search(&t) {
                 self.project.bookmarks.insert(i, t);
                 self.dirty = true;
+                self.toast(format!("Bookmark at {}", fmt_time(t as f64)));
             }
         }
         if k(cmd, Key::ArrowLeft) {
@@ -1723,6 +2074,7 @@ impl Work {
             if k(shift, key) {
                 self.project.divisor = n as u32 + 1;
                 self.dirty = true;
+                self.toast(format!("Snap 1/{}", n + 1));
             }
         }
         if k(cmd, Key::M) {
@@ -1732,20 +2084,29 @@ impl Work {
         // Tools.
         if k(none, Key::Num1) {
             self.tool = Tool::Select;
+            self.toast("Select tool");
         }
         if k(none, Key::Num2) {
             self.tool = Tool::Place;
+            self.toast("Place tool");
         }
 
         // Undo, save, clear.
         if k(cmd_shift, Key::Z) || k(cmd, Key::Y) {
+            if !self.redo.is_empty() {
+                self.toast("Redo");
+            }
             self.redo(engine);
         }
         if k(cmd, Key::Z) {
+            if !self.undo.is_empty() {
+                self.toast("Undo");
+            }
             self.undo(engine);
         }
         if k(cmd, Key::S) {
             self.save_now();
+            self.toast("Saved");
         }
         if k(cmd, Key::N) {
             self.confirm_clear = true;
@@ -1754,23 +2115,32 @@ impl Work {
         // Selection and clipboard.
         if k(cmd, Key::A) {
             self.selected = self.project.content.tracks.iter().flat_map(|t| t.notes.iter().map(move |&n| (t.id, n))).collect();
+            self.toast(format!("Selected {} hits", self.selected.len()));
         }
-        if k(cmd, Key::C) {
+        if k(cmd, Key::C) && !self.selected.is_empty() {
             self.copy_selection();
+            self.toast(format!("Copied {} hits", self.clipboard.len()));
         }
-        if k(cmd, Key::X) {
+        if k(cmd, Key::X) && !self.selected.is_empty() {
             self.copy_selection();
             self.delete_selection(engine);
+            self.toast(format!("Cut {} hits", self.clipboard.len()));
         }
         if k(cmd, Key::V) {
             let at = self.snap(pos).max(0);
             self.paste_at(at, engine);
+            if !self.clipboard.is_empty() {
+                self.toast(format!("Pasted {} hits", self.clipboard.len()));
+            }
         }
-        if k(cmd, Key::D) {
+        if k(cmd, Key::D) && !self.selected.is_empty() {
             self.clone_selection(engine);
+            self.toast("Cloned one measure later");
         }
-        if k(none, Key::Delete) || k(none, Key::Backspace) {
+        if (k(none, Key::Delete) || k(none, Key::Backspace)) && !self.selected.is_empty() {
+            let n = self.selected.len();
             self.delete_selection(engine);
+            self.toast(format!("Deleted {n} hits"));
         }
         if k(none, Key::J) {
             self.nudge_selection(-1, engine);
@@ -1822,6 +2192,29 @@ impl Work {
         false
     }
 
+    fn toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some((msg, at)) = &self.toast else { return };
+        let age = at.elapsed().as_secs_f32();
+        if age > 1.8 {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint();
+        let alpha = if age < 0.12 { age / 0.12 } else if age > 1.4 { (1.8 - age) / 0.4 } else { 1.0 };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("toast")));
+        let screen = ctx.content_rect();
+        let galley = painter.layout_no_wrap(msg.clone(), FontId::proportional(14.0), self.pal.text.gamma_multiply(alpha));
+        let size = galley.size() + vec2(28.0, 16.0);
+        let rect = Rect::from_center_size(pos2(screen.center().x, screen.bottom() - 70.0 + (1.0 - alpha) * 8.0), size);
+        painter.rect_filled(rect, CornerRadius::same(10), self.pal.panel.gamma_multiply(alpha));
+        painter.rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, self.pal.border.gamma_multiply(alpha)), StrokeKind::Inside);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, self.pal.text);
+    }
+
     fn step_ms(&self, t: f64) -> f64 {
         osu::red_line_at(&self.reds, t).beat_length / self.project.divisor as f64
     }
@@ -1834,12 +2227,17 @@ impl Work {
         if let Some(d) = next {
             self.project.divisor = d;
             self.dirty = true;
+            self.toast(format!("Snap 1/{d}"));
         }
     }
 
     fn set_speed(&mut self, speed: f64, engine: Option<&Engine>) {
         // Round to 5% so repeated steps don't drift.
-        self.speed = ((speed.clamp(0.25, 1.0) * 20.0).round()) / 20.0;
+        let new = ((speed.clamp(0.25, 1.0) * 20.0).round()) / 20.0;
+        if (new - self.speed).abs() > 0.001 {
+            self.toast(format!("Speed {:.0}%", new * 100.0));
+        }
+        self.speed = new;
         if let Some(e) = engine {
             e.set_speed(self.speed);
         }
