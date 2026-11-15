@@ -17,7 +17,7 @@ use crate::project::{self, Content, ControlPoint, Project, ProjectEntry, SampleE
 const HEADER_W: f32 = 300.0;
 const RULER_H: f32 = 20.0;
 const WAVE_H: f32 = 84.0;
-const LANE_H: f32 = 58.0;
+const LANE_H: f32 = 76.0;
 const ROW_H: f32 = 68.0;
 
 #[derive(Serialize, Deserialize)]
@@ -44,67 +44,99 @@ impl Settings {
     }
 }
 
-/// Mode switch plus palette swatches. Returns true when the user picked something.
+/// Theme picker: an icon button that rolls a strip of options out to the left:
+/// a light/dark switch and the five palettes of the current mode.
+/// Returns true when the user picked something.
 fn theme_menu(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
+    const SLOT: f32 = 28.0;
+    const PAD: f32 = 6.0;
+    const DIVIDER: f32 = 10.0;
+    let id = egui::Id::unique("theme-roll");
+    let ctx = ui.ctx().clone();
+    let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let pal = settings.palette();
     let mut changed = false;
-    let label = "Theme";
-    ui.menu_button(label, |ui| {
-        ui.set_min_width(250.0);
-        ui.horizontal(|ui| {
-            if ui.selectable_label(!settings.dark_mode, "Light").clicked() && settings.dark_mode {
-                settings.dark_mode = false;
-                changed = true;
-            }
-            if ui.selectable_label(settings.dark_mode, "Dark").clicked() && !settings.dark_mode {
-                settings.dark_mode = true;
-                changed = true;
-            }
-            ui.label(egui::RichText::new("Ctrl+T switches").small().weak());
-        });
-        for (dark, list) in [(true, &theme::DARK), (false, &theme::LIGHT)] {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(if dark { "Dark palettes" } else { "Light palettes" }).small().weak());
-            for (i, p) in list.iter().enumerate() {
-                let current = if dark { settings.dark_palette } else { settings.light_palette };
-                let selected = settings.dark_mode == dark && current == i;
-                if swatch(ui, p, selected).clicked() {
-                    settings.dark_mode = dark;
-                    if dark {
-                        settings.dark_palette = i;
-                    } else {
-                        settings.light_palette = i;
-                    }
-                    changed = true;
-                }
-            }
-        }
-    });
-    changed
-}
 
-/// One clickable palette preview drawn in its own colours.
-fn swatch(ui: &mut egui::Ui, p: &Palette, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(240.0), 30.0), Sense::click());
-    let painter = ui.painter();
-    let stroke = if selected {
-        Stroke::new(2.0, p.accent)
-    } else if resp.hovered() {
-        Stroke::new(1.0, p.accent)
-    } else {
-        Stroke::new(1.0, p.border)
-    };
-    painter.rect_filled(rect, CornerRadius::same(6), p.bg);
-    painter.rect_stroke(rect, CornerRadius::same(6), stroke, StrokeKind::Inside);
-    let mut x = rect.left() + 14.0;
-    for c in [p.accent, p.tracks[1], p.tracks[2], p.tracks[3], p.tracks[4]] {
-        painter.circle_filled(pos2(x, rect.center().y), 6.0, c);
-        x += 15.0;
+    let icon = icons::button(ui, &pal, Icon::Theme, "Theme (Ctrl+T switches light / dark)", open, true);
+    if icon.clicked() {
+        open = !open;
     }
-    painter.text(pos2(x + 6.0, rect.center().y), Align2::LEFT_CENTER, p.name, FontId::proportional(13.0), p.text);
-    if selected {
-        painter.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, "current", FontId::proportional(11.0), p.text_weak);
+    let t = ctx.animate_bool_with_time_and_easing(id.with("t"), open, 0.32, egui::emath::easing::cubic_out);
+    let mut strip = Rect::NOTHING;
+    if t > 0.001 {
+        let full_w = PAD * 2.0 + SLOT * 7.0 + DIVIDER;
+        let (rect, _) = ui.allocate_exact_size(vec2(full_w * t, 30.0), Sense::hover());
+        strip = rect;
+        let painter = ui.painter().with_clip_rect(rect.expand(3.0));
+        painter.rect_filled(rect, CornerRadius::same(15), pal.panel);
+        painter.rect_stroke(rect, CornerRadius::same(15), Stroke::new(1.0, pal.border), StrokeKind::Inside);
+        let right = rect.right();
+        let cy = rect.center().y;
+        // Items are anchored to the right edge, so they are revealed one by one as the strip grows left.
+        let reveal = |cx: f32| (((rect.width() - (right - cx)) + SLOT * 0.5) / SLOT).clamp(0.0, 1.0);
+        let list = if settings.dark_mode { &theme::DARK } else { &theme::LIGHT };
+        let current = if settings.dark_mode { settings.dark_palette } else { settings.light_palette };
+        for (k, p) in list.iter().enumerate() {
+            let cx = right - PAD - SLOT * 0.5 - (4 - k) as f32 * SLOT;
+            let a = reveal(cx);
+            if a <= 0.0 {
+                continue;
+            }
+            let c = pos2(cx, cy);
+            let hit = Rect::from_center_size(c, Vec2::splat(SLOT - 2.0));
+            let resp = ui.interact(hit, id.with(("swatch", k)), if a > 0.95 { Sense::click() } else { Sense::hover() });
+            let selected = k == current;
+            let ring = if selected { Stroke::new(2.0, pal.accent) } else if resp.hovered() { Stroke::new(1.5, pal.text) } else { Stroke::new(1.0, pal.border) };
+            painter.circle_filled(c, 10.0 * a, p.bg);
+            painter.circle_stroke(c, 10.0 * a, ring);
+            painter.circle_filled(c, 5.0 * a, p.accent);
+            if resp.clicked() {
+                if settings.dark_mode {
+                    settings.dark_palette = k;
+                } else {
+                    settings.light_palette = k;
+                }
+                changed = true;
+            }
+            resp.on_hover_text(p.name);
+        }
+        let div_x = right - PAD - SLOT * 5.0 - DIVIDER * 0.5;
+        if reveal(div_x) > 0.0 {
+            painter.vline(div_x, (cy - 8.0)..=(cy + 8.0), Stroke::new(1.0, pal.border));
+        }
+        for (dark, icon_kind, tip, n) in [(true, Icon::Moon, "Dark mode", 0.0), (false, Icon::Sun, "Light mode", 1.0)] {
+            let cx = right - PAD - SLOT * 5.0 - DIVIDER - SLOT * 0.5 - n * SLOT;
+            let a = reveal(cx);
+            if a <= 0.0 {
+                continue;
+            }
+            let c = pos2(cx, cy);
+            let hit = Rect::from_center_size(c, Vec2::splat(SLOT - 2.0));
+            let resp = ui.interact(hit, id.with(("mode", n as i32)), if a > 0.95 { Sense::click() } else { Sense::hover() });
+            let on = settings.dark_mode == dark;
+            if on || resp.hovered() {
+                painter.circle_filled(c, 12.0 * a, if on { pal.accent.gamma_multiply(0.25) } else { pal.text.gamma_multiply(0.08) });
+            }
+            icons::paint(&painter, Rect::from_center_size(c, Vec2::splat(16.0 * a)), icon_kind, if on { pal.accent } else { pal.text });
+            if resp.clicked() && !on {
+                settings.dark_mode = dark;
+                changed = true;
+            }
+            resp.on_hover_text(tip);
+        }
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    // Close when clicking anywhere else, or with Esc.
+    if open {
+        let outside = ui.input(|i| i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| !strip.contains(p) && !icon.rect.contains(p)));
+        if outside || ui.input(|i| i.key_pressed(Key::Escape)) {
+            open = false;
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, open));
+    changed
 }
 
 struct Picked {
@@ -674,7 +706,8 @@ enum Drag {
     Notes { anchor: i64, delta: i64 },
     /// Rubber-band selection in screen coordinates.
     Box { start: Pos2, cur: Pos2 },
-    Point { idx: usize, orig: ControlPoint, cur: ControlPoint },
+    /// Dragging a volume point. `axis`: 0 = undecided, 1 = volume (vertical), 2 = time (horizontal).
+    Point { idx: usize, orig: ControlPoint, cur: ControlPoint, axis: u8 },
     Pan { start_view: f64 },
 }
 
@@ -1294,6 +1327,39 @@ impl Work {
             }
         }
 
+        if !self.selected.is_empty() {
+            let pal = self.pal;
+            let n = self.selected.len();
+            egui::Area::new(egui::Id::unique("selection-bar"))
+                .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -52.0))
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(pal.panel)
+                        .stroke(Stroke::new(1.0, pal.border))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(90) })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("{n} selected")).strong());
+                                ui.add_space(8.0);
+                                let del = egui::Button::new(egui::RichText::new("Delete").color(pal.bg)).fill(pal.danger);
+                                if ui.add(del).on_hover_text("Delete the selected hits (Delete key)").clicked() {
+                                    self.delete_selection(engine);
+                                    self.toast(format!("Deleted {n} hits"));
+                                }
+                                if ui.button("Copy").on_hover_text("Ctrl+C; paste at the playhead with Ctrl+V").clicked() {
+                                    self.copy_selection();
+                                    self.toast(format!("Copied {n} hits"));
+                                }
+                                if ui.button("Deselect").on_hover_text("Esc").clicked() {
+                                    self.selected.clear();
+                                }
+                            });
+                        });
+                });
+        }
         self.draw_toast(&ctx);
         if self.show_keys {
             let mut open = true;
@@ -1649,27 +1715,50 @@ impl Work {
         }
     }
 
+    /// Vertical padding so points at 5% and 100% stay fully inside the lane.
+    const VOL_PAD: f32 = 10.0;
+
     fn vol_y(rect: Rect, v: u8) -> f32 {
-        rect.bottom() - 4.0 - (rect.height() - 8.0) * v as f32 / 100.0
+        rect.bottom() - Self::VOL_PAD - (rect.height() - 2.0 * Self::VOL_PAD) * v as f32 / 100.0
     }
 
-    fn y_vol(rect: Rect, y: f32) -> u8 {
-        let v = ((rect.bottom() - 4.0 - y) / (rect.height() - 8.0) * 100.0).round();
-        (v.clamp(5.0, 100.0) as u8 / 5 * 5).max(5)
+    /// Volume at a y position: 5% steps, or 1% steps when `fine`.
+    fn y_vol(rect: Rect, y: f32, fine: bool) -> u8 {
+        let raw = (rect.bottom() - Self::VOL_PAD - y) / (rect.height() - 2.0 * Self::VOL_PAD) * 100.0;
+        let v = if fine { raw.round() } else { (raw / 5.0).round() * 5.0 };
+        v.clamp(5.0, 100.0) as u8
     }
 
     fn volume_lane(&mut self, ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
+        let pal = self.pal;
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(4), self.pal.lane);
+        painter.rect_filled(rect, CornerRadius::same(4), pal.lane);
         self.draw_grid(&painter, rect, true);
+
+        // Working copy with the drag preview applied (moves are clamped between neighbours, so order holds).
         let mut cps = self.project.content.control_points.clone();
+        let mut dragging = None;
         if let Some(Drag::Point { idx, cur, .. }) = &self.drag {
             if *idx < cps.len() {
                 cps[*idx] = *cur;
-                cps.sort_by_key(|c| c.time);
+                dragging = Some(*idx);
             }
         }
-        let fill = self.pal.vol_fill;
+        let nearest = |w: &Self, p: Pos2| -> Option<usize> {
+            w.project
+                .content
+                .control_points
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, (w.x_of(rect, c.time as f64) - p.x).abs()))
+                .filter(|&(_, d)| d < 9.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
+        let hover = resp.hover_pos();
+        let hovered = if self.drag.is_none() { hover.and_then(|p| nearest(self, p)) } else { None };
+
+        // Step graph.
         for (i, c) in cps.iter().enumerate() {
             let x0 = if i == 0 { rect.left() } else { self.x_of(rect, c.time as f64).max(rect.left()) };
             let x1 = cps.get(i + 1).map(|n| self.x_of(rect, n.time as f64)).unwrap_or(rect.right()).min(rect.right());
@@ -1677,60 +1766,103 @@ impl Work {
                 continue;
             }
             let y = Self::vol_y(rect, c.volume);
-            painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, rect.bottom())), 0.0, fill);
-            painter.hline(x0..=x1, y, Stroke::new(1.5, self.pal.vol_line));
+            painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, rect.bottom())), 0.0, pal.vol_fill);
+            painter.hline(x0..=x1, y, Stroke::new(1.5, pal.vol_line));
+            if let Some(n) = cps.get(i + 1) {
+                let xn = self.x_of(rect, n.time as f64);
+                if rect.x_range().contains(xn) {
+                    painter.vline(xn, Self::vol_y(rect, c.volume).min(Self::vol_y(rect, n.volume))..=Self::vol_y(rect, c.volume).max(Self::vol_y(rect, n.volume)), Stroke::new(1.5, pal.vol_line));
+                }
+            }
         }
-        for c in &cps {
-            let x = self.x_of(rect, c.time as f64);
-            if rect.x_range().contains(x) {
-                let y = Self::vol_y(rect, c.volume);
-                painter.circle_filled(pos2(x, y), 5.0, self.pal.vol_line);
-                painter.text(pos2(x + 7.0, y - 2.0), Align2::LEFT_BOTTOM, format!("{}%", c.volume), FontId::proportional(11.0), self.pal.text);
+
+        // Points, with labels that stay inside the lane and don't overlap.
+        let xs: Vec<f32> = cps.iter().map(|c| self.x_of(rect, c.time as f64)).collect();
+        for (i, c) in cps.iter().enumerate() {
+            let x = xs[i];
+            if !(rect.left() - 10.0..=rect.right() + 10.0).contains(&x) {
+                continue;
+            }
+            let y = Self::vol_y(rect, c.volume);
+            let active = Some(i) == dragging || Some(i) == hovered;
+            painter.circle_filled(pos2(x, y), if active { 6.5 } else { 4.5 }, pal.vol_line);
+            painter.circle_stroke(pos2(x, y), if active { 6.5 } else { 4.5 }, Stroke::new(1.5, pal.lane));
+            let room = xs.get(i + 1).map(|n| n - x).unwrap_or(f32::MAX);
+            if active || room > 46.0 {
+                let text = format!("{}%", c.volume);
+                let (anchor, ty) = if y - 16.0 < rect.top() { (Align2::LEFT_TOP, y + 3.0) } else { (Align2::LEFT_BOTTOM, y - 3.0) };
+                painter.text(pos2(x + 8.0, ty), anchor, text, FontId::proportional(if active { 12.5 } else { 11.0 }), if active { pal.text } else { pal.text_weak });
+            }
+        }
+
+        // Ghost preview of what a click would add.
+        if self.drag.is_none() && hovered.is_none() {
+            if let Some(p) = hover {
+                let t = self.snap(self.t_of(rect, p.x)).max(0);
+                let gx = self.x_of(rect, t as f64);
+                let v = Self::y_vol(rect, p.y, ui.input(|i| i.modifiers.shift));
+                let gy = Self::vol_y(rect, v);
+                painter.circle_stroke(pos2(gx, gy), 4.5, Stroke::new(1.5, pal.vol_line.gamma_multiply(0.7)));
+                painter.text(pos2(gx + 8.0, gy - 3.0), Align2::LEFT_BOTTOM, format!("+ {v}%"), FontId::proportional(11.0), pal.text_weak);
             }
         }
         self.draw_playhead(&painter, rect, pos);
 
-        let hit = |w: &Self, p: Pos2| -> Option<usize> {
-            w.project.content.control_points.iter().enumerate().filter(|(_, c)| (w.x_of(rect, c.time as f64) - p.x).abs() < 8.0).map(|(i, _)| i).next()
-        };
+        // Interaction.
+        let fine = ui.input(|i| i.modifiers.shift);
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
-                if let Some(i) = hit(self, p) {
+                if let Some(i) = nearest(self, p) {
                     let c = self.project.content.control_points[i];
-                    self.drag = Some(Drag::Point { idx: i, orig: c, cur: c });
+                    // The first point anchors the start of the song, so it only changes volume.
+                    self.drag = Some(Drag::Point { idx: i, orig: c, cur: c, axis: if i == 0 { 1 } else { 0 } });
                 }
             }
         }
-        if let (Some(Drag::Point { orig, .. }), Some(p)) = (&self.drag, resp.interact_pointer_pos()) {
-            let orig_x = self.x_of(rect, orig.time as f64);
-            let t = self.snap(self.t_of(rect, p.x)).max(0);
-            let volume = Self::y_vol(rect, p.y);
-            if let Some(Drag::Point { orig, cur, .. }) = &mut self.drag {
-                // Small horizontal jitter while adjusting volume shouldn't move the point.
-                cur.time = if (p.x - orig_x).abs() > 6.0 { t } else { orig.time };
-                cur.volume = volume;
+        if resp.dragged() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            if let (Some(p), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                let snapped_t = self.snap(self.t_of(rect, p.x)).max(0);
+                let cps = &self.project.content.control_points;
+                if let Some(Drag::Point { idx, orig, cur, axis }) = &mut self.drag {
+                    let d = p - o;
+                    if *axis == 0 && d.length() > 4.0 {
+                        *axis = if d.x.abs() > d.y.abs() { 2 } else { 1 };
+                    }
+                    match *axis {
+                        1 => {
+                            cur.time = orig.time;
+                            cur.volume = Self::y_vol(rect, p.y, fine);
+                        }
+                        2 => {
+                            // Stop at the neighbours instead of jumping over or onto them.
+                            let lo = cps.get(*idx - 1).map(|c| c.time + 1).unwrap_or(0);
+                            let hi = cps.get(*idx + 1).map(|c| c.time - 1).unwrap_or(i64::MAX);
+                            cur.time = snapped_t.clamp(lo, hi.max(lo));
+                            cur.volume = orig.volume;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         if resp.drag_stopped() {
-            if let Some(Drag::Point { idx, orig, cur }) = self.drag.take() {
-                if orig != cur {
-                    let taken = self.project.content.control_points.iter().enumerate().any(|(i, c)| i != idx && c.time == cur.time);
-                    if !taken {
-                        self.checkpoint();
-                        self.project.content.control_points[idx] = cur;
-                        self.project.content.control_points.sort_by_key(|c| c.time);
-                        self.changed(engine);
-                    }
+            if let Some(Drag::Point { idx, orig, cur, .. }) = self.drag.take() {
+                if orig != cur && idx < self.project.content.control_points.len() {
+                    self.checkpoint();
+                    self.project.content.control_points[idx] = cur;
+                    self.project.content.control_points.sort_by_key(|c| c.time);
+                    self.changed(engine);
                 }
             }
         }
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                if hit(self, p).is_none() {
+                if nearest(self, p).is_none() {
                     let t = self.snap(self.t_of(rect, p.x)).max(0);
                     if !self.project.content.control_points.iter().any(|c| c.time == t) {
                         self.checkpoint();
-                        self.project.content.control_points.push(ControlPoint { time: t, volume: Self::y_vol(rect, p.y) });
+                        self.project.content.control_points.push(ControlPoint { time: t, volume: Self::y_vol(rect, p.y, fine) });
                         self.project.content.control_points.sort_by_key(|c| c.time);
                         self.changed(engine);
                     }
@@ -1739,14 +1871,27 @@ impl Work {
         }
         if resp.secondary_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                if let Some(i) = hit(self, p) {
+                if let Some(i) = nearest(self, p) {
                     if self.project.content.control_points.len() > 1 {
                         self.checkpoint();
                         self.project.content.control_points.remove(i);
                         self.changed(engine);
+                        self.toast("Volume point deleted");
                     }
                 }
             }
+        }
+        if resp.hovered() || resp.dragged() {
+            let cursor = match &self.drag {
+                Some(Drag::Point { axis: 2, .. }) => egui::CursorIcon::ResizeHorizontal,
+                Some(Drag::Point { .. }) => egui::CursorIcon::ResizeVertical,
+                _ if hovered.is_some() => egui::CursorIcon::Grab,
+                _ => egui::CursorIcon::Crosshair,
+            };
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if hovered.is_some() {
+            resp.clone().on_hover_text_at_pointer("Drag up/down: volume (Shift: 1% steps) · drag sideways: move · right-click: delete");
         }
     }
 
@@ -1833,7 +1978,8 @@ impl Work {
                         self.selected.insert((tid, n));
                     }
                     self.drag = Some(Drag::Notes { anchor: n, delta: 0 });
-                } else if self.tool == Tool::Select {
+                } else {
+                    // Dragging across empty grid draws a selection box in either tool.
                     if !ctrl {
                         self.selected.clear();
                     }
@@ -1922,7 +2068,7 @@ impl Work {
             let hint = if self.project.content.tracks[ti].sample.is_none() {
                 "Pick a sample for this track first"
             } else if self.tool == Tool::Place {
-                "Click: add · drag: move · right-click: delete · 1: Select tool"
+                "Click: add · drag empty space: select · drag a hit: move · right-click: delete"
             } else {
                 "Click: select · drag: box select or move · Ctrl: add to selection · 2: Place tool"
             };
@@ -2225,7 +2371,7 @@ impl Work {
         let screen = ctx.content_rect();
         let galley = painter.layout_no_wrap(msg.clone(), FontId::proportional(14.0), self.pal.text.gamma_multiply(alpha));
         let size = galley.size() + vec2(28.0, 16.0);
-        let rect = Rect::from_center_size(pos2(screen.center().x, screen.bottom() - 70.0 + (1.0 - alpha) * 8.0), size);
+        let rect = Rect::from_center_size(pos2(screen.center().x, screen.bottom() - 120.0 + (1.0 - alpha) * 8.0), size);
         painter.rect_filled(rect, CornerRadius::same(10), self.pal.panel.gamma_multiply(alpha));
         painter.rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, self.pal.border.gamma_multiply(alpha)), StrokeKind::Inside);
         painter.galley(rect.center() - galley.size() / 2.0, galley, self.pal.text);

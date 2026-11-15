@@ -28,6 +28,8 @@ pub enum Icon {
     Headphones,
     Follow,
     Music,
+    Sun,
+    Moon,
 }
 
 /// Draw `icon` centred in `rect` (designed on a 16x16 grid).
@@ -134,6 +136,28 @@ pub fn paint(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[(3.0, 3.0), (3.0, 13.0)]);
             line(&[(6.0, 8.0), (13.0, 8.0)]);
             line(&[(10.0, 5.0), (13.0, 8.0), (10.0, 11.0)]);
+        }
+        Icon::Sun => {
+            p.circle_filled(pt(8.0, 8.0), 3.0 * s, color);
+            for i in 0..8 {
+                let a = std::f32::consts::TAU * i as f32 / 8.0;
+                let (c, sn) = (a.cos(), a.sin());
+                line(&[(8.0 + 5.0 * c, 8.0 + 5.0 * sn), (8.0 + 7.0 * c, 8.0 + 7.0 * sn)]);
+            }
+        }
+        Icon::Moon => {
+            // Crescent: outer arc one way, inner arc back.
+            let mut pts = Vec::new();
+            for i in 0..=20 {
+                let a = (-50.0 + 280.0 * i as f32 / 20.0).to_radians();
+                pts.push(pt(8.0 + 6.0 * a.cos(), 8.0 + 6.0 * a.sin()));
+            }
+            for i in 0..=20 {
+                let a = (230.0 - 280.0 * i as f32 / 20.0).to_radians();
+                pts.push(pt(10.5 + 4.6 * a.cos(), 5.8 + 4.6 * a.sin()));
+            }
+            pts.push(pts[0]);
+            p.add(Shape::line(pts, st));
         }
         Icon::Music => {
             p.circle_filled(pt(5.5, 12.0), 2.3 * s, color);
