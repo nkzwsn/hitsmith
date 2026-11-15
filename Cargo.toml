@@ -1,0 +1,22 @@
+[package]
+name = "hitsmith"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+hound = "3.5.1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "ogg", "vorbis", "wav", "pcm"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
