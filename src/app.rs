@@ -2255,7 +2255,8 @@ impl Work {
     }
 
     fn seek_ticks(&mut self, engine: Option<&Engine>, n: i32) {
-        let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        // Count from where the head is heading, so fast notches add up during a scrub.
+        let pos = engine.map(|e| e.heading_ms()).unwrap_or(0.0);
         let playing = engine.is_some_and(|e| e.is_playing());
         let forward = n > 0;
         // While playing, the song has moved on a little since the last jump. Going back,
@@ -2268,7 +2269,14 @@ impl Work {
         for _ in 0..n.abs() {
             t = osu::adjacent_tick(&self.reds, t, self.project.divisor, forward);
         }
-        self.seek(engine, t);
+        // Glide there like a DJ dragging the record, instead of a hard cut.
+        let t = t.clamp(0.0, self.duration());
+        if let Some(e) = engine {
+            e.scrub_to_ms(t);
+        }
+        if t < self.view_start || t > self.view_start + self.view_span * 0.9 {
+            self.view_start = t - self.view_span * 0.25;
+        }
     }
 
     fn audition_track(&mut self, ti: usize, t: i64, engine: Option<&Engine>) {

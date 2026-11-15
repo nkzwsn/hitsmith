@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -145,13 +146,23 @@ struct Voice {
     gain: f32,
 }
 
+/// Scrub feel: how fast the head chases its target, how heavy it is, and its top speed.
+const SCRUB_TAU_SECS: f64 = 0.07;
+const SCRUB_INERTIA_SECS: f64 = 0.018;
+const SCRUB_MAX_SPEED: f64 = 10.0;
+
 #[derive(Default)]
 struct Mix {
     song: Arc<Vec<i16>>,
-    /// Song position in frames; fractional so playback speed can change.
+    /// Song position in frames; fractional so speed can change (and run backwards when scrubbing).
     pos: f64,
     rate: f64,
     playing: bool,
+    /// While set, the head glides toward this frame like a hand dragging vinyl.
+    target: Option<f64>,
+    /// Current head velocity in frames per output frame.
+    vel: f64,
+    sr: f64,
     song_gain: f32,
     hit_gain: f32,
     master: f32,
@@ -166,12 +177,33 @@ impl Mix {
         self.cursor = self.events.partition_point(|e| (e.frame as f64) < self.pos);
         self.voices.clear();
     }
+    fn base_speed(&self) -> f64 {
+        if self.playing { self.rate } else { 0.0 }
+    }
+}
+
+/// State the UI reads every frame without touching the mixer lock, so drawing
+/// never makes the audio thread wait.
+#[derive(Default)]
+struct Shared {
+    pos: AtomicU64,
+    target: AtomicU64,
+    playing: AtomicBool,
+}
+
+impl Shared {
+    fn publish(&self, m: &Mix) {
+        self.pos.store(m.pos.to_bits(), Ordering::Relaxed);
+        self.target.store(m.target.unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
+        self.playing.store(m.playing, Ordering::Relaxed);
+    }
 }
 
 pub struct Engine {
     _stream: cpal::Stream,
     pub rate: u32,
     mix: Arc<Mutex<Mix>>,
+    shared: Arc<Shared>,
 }
 
 impl Engine {
@@ -183,29 +215,34 @@ impl Engine {
         let config: cpal::StreamConfig = supported.into();
         let rate = config.sample_rate;
         let channels = config.channels as usize;
-        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, ..Default::default() }));
-        let m = mix.clone();
+        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, sr: rate as f64, ..Default::default() }));
+        let shared = Arc::new(Shared::default());
+        let (m, sh) = (mix.clone(), shared.clone());
         let err = |e| eprintln!("audio stream error: {e}");
         let stream = match format {
-            cpal::SampleFormat::F32 => device.build_output_stream(config, move |out: &mut [f32], _: &cpal::OutputCallbackInfo| render(&m, out, channels, |v| v), err, None)?,
-            cpal::SampleFormat::I16 => device.build_output_stream(config, move |out: &mut [i16], _: &cpal::OutputCallbackInfo| render(&m, out, channels, |v| (v * i16::MAX as f32) as i16), err, None)?,
-            cpal::SampleFormat::I32 => device.build_output_stream(config, move |out: &mut [i32], _: &cpal::OutputCallbackInfo| render(&m, out, channels, |v| (v as f64 * i32::MAX as f64) as i32), err, None)?,
+            cpal::SampleFormat::F32 => device.build_output_stream(config, move |out: &mut [f32], _: &cpal::OutputCallbackInfo| render(&m, &sh, out, channels, |v| v), err, None)?,
+            cpal::SampleFormat::I16 => device.build_output_stream(config, move |out: &mut [i16], _: &cpal::OutputCallbackInfo| render(&m, &sh, out, channels, |v| (v * i16::MAX as f32) as i16), err, None)?,
+            cpal::SampleFormat::I32 => device.build_output_stream(config, move |out: &mut [i32], _: &cpal::OutputCallbackInfo| render(&m, &sh, out, channels, |v| (v as f64 * i32::MAX as f64) as i32), err, None)?,
             other => bail!("unsupported output sample format {other}"),
         };
         stream.play()?;
-        Ok(Self { _stream: stream, rate, mix })
+        Ok(Self { _stream: stream, rate, mix, shared })
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Mix) -> R) -> R {
         let mut g = self.mix.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut g)
+        let r = f(&mut g);
+        self.shared.publish(&g);
+        r
     }
 
     pub fn set_song(&self, song: Arc<Vec<i16>>) {
         self.with(|m| {
             m.song = song;
             m.pos = 0.0;
+            m.target = None;
             m.playing = false;
+            m.vel = 0.0;
             m.reset_cursor();
         });
     }
@@ -216,8 +253,9 @@ impl Engine {
         });
     }
     pub fn set_events(&self, events: Vec<Event>) {
+        let events = Arc::new(events);
         self.with(|m| {
-            m.events = Arc::new(events);
+            m.events = events;
             m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
         });
     }
@@ -236,21 +274,41 @@ impl Engine {
         });
     }
     pub fn is_playing(&self) -> bool {
-        self.with(|m| m.playing)
+        self.shared.playing.load(Ordering::Relaxed)
     }
     /// Playback speed (1.0 = normal). Hitsounds keep their pitch; the song is resampled.
     pub fn set_speed(&self, speed: f64) {
         self.with(|m| m.rate = speed.clamp(0.1, 4.0));
     }
+    /// Jump straight to a time (clicks on the ruler, Home, etc.).
     pub fn seek_ms(&self, ms: f64) {
         let frame = ms.max(0.0) * self.rate as f64 / 1000.0;
         self.with(|m| {
             m.pos = frame;
+            m.target = None;
+            m.vel = m.base_speed();
             m.reset_cursor();
         });
     }
+    /// Glide to a time with a vinyl-style scrub instead of a hard cut.
+    pub fn scrub_to_ms(&self, ms: f64) {
+        let frame = ms.max(0.0) * self.rate as f64 / 1000.0;
+        self.with(|m| {
+            if m.target.is_none() {
+                m.vel = m.base_speed();
+            }
+            m.target = Some(frame);
+        });
+    }
+    /// Where the head is right now (moves smoothly while scrubbing).
     pub fn position_ms(&self) -> f64 {
-        self.with(|m| m.pos) * 1000.0 / self.rate as f64
+        f64::from_bits(self.shared.pos.load(Ordering::Relaxed)) * 1000.0 / self.rate as f64
+    }
+    /// Where the head is heading: the scrub target if any, else the position.
+    /// Stepping by ticks counts from here, so quick notches add up.
+    pub fn heading_ms(&self) -> f64 {
+        let t = f64::from_bits(self.shared.target.load(Ordering::Relaxed));
+        if t.is_nan() { self.position_ms() } else { t * 1000.0 / self.rate as f64 }
     }
     /// Play a sample right away (auditioning), independent of the transport.
     pub fn audition(&self, sample: u32, gain: f32) {
@@ -263,43 +321,77 @@ impl Engine {
     pub fn stop_all(&self) {
         self.with(|m| {
             m.playing = false;
+            m.target = None;
+            m.vel = 0.0;
             m.voices.clear();
         });
     }
 }
 
-fn render<T: Copy>(mix: &Mutex<Mix>, out: &mut [T], channels: usize, conv: impl Fn(f32) -> T) {
+fn song_frame(song: &[i16], pos: f64) -> (f32, f32) {
+    if pos < 0.0 {
+        return (0.0, 0.0);
+    }
+    let i0 = pos as usize;
+    let i = i0 * 2;
+    if i + 3 < song.len() {
+        // Linear interpolation for non-1x speeds and scrubbing.
+        let f = (pos - i0 as f64) as f32;
+        (song[i] as f32 + (song[i + 2] as f32 - song[i] as f32) * f, song[i + 1] as f32 + (song[i + 3] as f32 - song[i + 1] as f32) * f)
+    } else if i + 1 < song.len() {
+        (song[i] as f32, song[i + 1] as f32)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: usize, conv: impl Fn(f32) -> T) {
     let zero = conv(0.0);
-    let Ok(mut m) = mix.try_lock() else {
-        out.fill(zero);
-        return;
-    };
-    let m = &mut *m;
+    // Wait for the lock instead of dropping the buffer: the UI only holds it for a
+    // moment, while a skipped buffer is an audible stutter.
+    let mut guard = mix.lock().unwrap_or_else(|e| e.into_inner());
+    let m = &mut *guard;
+    let tau = SCRUB_TAU_SECS * m.sr;
+    let inertia = 1.0 / (SCRUB_INERTIA_SECS * m.sr);
     for frame in out.chunks_mut(channels) {
         let (mut l, mut r) = (0f32, 0f32);
-        if m.playing {
-            while m.cursor < m.events.len() && m.events[m.cursor].frame as f64 <= m.pos {
-                let e = m.events[m.cursor];
-                if m.voices.len() < 96 {
-                    m.voices.push(Voice { sample: e.sample, pos: 0, gain: e.gain });
-                }
-                m.cursor += 1;
+        let base = m.base_speed();
+        let scrubbing = m.target.is_some();
+        if let Some(tg) = m.target.as_mut() {
+            // The target keeps running with playback, so the head lands in time with the music.
+            *tg += base;
+            let dist = *tg - m.pos;
+            let want = (dist / tau).clamp(-SCRUB_MAX_SPEED, SCRUB_MAX_SPEED) + base;
+            m.vel += (want - m.vel) * inertia;
+            if dist.abs() < 1.5 && (m.vel - base).abs() < 0.02 {
+                m.pos = *tg;
+                m.target = None;
+                m.vel = base;
+                // Resume hitsounds from here without cutting ones still ringing.
+                m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
             }
-            let i0 = m.pos as usize;
-            let i = i0 * 2;
+        } else {
+            m.vel = base;
+        }
+
+        if m.vel != 0.0 {
+            if m.playing && !scrubbing {
+                while m.cursor < m.events.len() && m.events[m.cursor].frame as f64 <= m.pos {
+                    let e = m.events[m.cursor];
+                    if m.voices.len() < 96 {
+                        m.voices.push(Voice { sample: e.sample, pos: 0, gain: e.gain });
+                    }
+                    m.cursor += 1;
+                }
+            }
             let g = m.song_gain / 32768.0;
-            if i + 3 < m.song.len() {
-                // Linear interpolation between frames for non-1x speeds.
-                let f = (m.pos - i0 as f64) as f32;
-                l += (m.song[i] as f32 + (m.song[i + 2] as f32 - m.song[i] as f32) * f) * g;
-                r += (m.song[i + 1] as f32 + (m.song[i + 3] as f32 - m.song[i + 1] as f32) * f) * g;
-            } else if i + 1 < m.song.len() {
-                l += m.song[i] as f32 * g;
-                r += m.song[i + 1] as f32 * g;
-            } else if m.events.get(m.cursor).is_none() && m.voices.is_empty() {
+            let (sl, sr) = song_frame(&m.song, m.pos);
+            l += sl * g;
+            r += sr * g;
+            m.pos = (m.pos + m.vel).max(0.0);
+            if m.playing && !scrubbing && (m.pos as usize) * 2 + 1 >= m.song.len() && m.events.get(m.cursor).is_none() && m.voices.is_empty() {
                 m.playing = false;
             }
-            m.pos += m.rate;
         }
         let hit = m.hit_gain;
         let samples = &m.samples;
@@ -327,6 +419,7 @@ fn render<T: Copy>(mix: &Mutex<Mix>, out: &mut [T], channels: usize, conv: impl 
             }
         }
     }
+    shared.publish(m);
 }
 
 /// Halve memory for the long song buffer; 16-bit is plenty for playback.
@@ -369,5 +462,49 @@ mod tests {
         assert_eq!(back.frames(), 1000);
         assert!((back.data[10] - pcm.data[10]).abs() < 1e-3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_rewinds_then_lands_in_time() {
+        let sr = 48_000.0;
+        let mix = Mutex::new(Mix {
+            song: Arc::new(vec![1000i16; 48_000 * 2 * 10]),
+            pos: sr * 2.0,
+            rate: 1.0,
+            playing: true,
+            sr,
+            song_gain: 1.0,
+            hit_gain: 1.0,
+            master: 1.0,
+            ..Default::default()
+        });
+        let shared = Shared::default();
+        // Ask to go 300 ms back while playing.
+        {
+            let mut m = mix.lock().unwrap();
+            m.vel = 1.0;
+            m.target = Some(m.pos - 0.3 * sr);
+        }
+        let mut buf = vec![0f32; 2 * 480]; // 10 ms blocks
+        let mut went_backwards = false;
+        for _ in 0..60 {
+            let before = mix.lock().unwrap().pos;
+            render(&mix, &shared, &mut buf, 2, |v| v);
+            if mix.lock().unwrap().pos < before {
+                went_backwards = true;
+            }
+        }
+        let m = mix.lock().unwrap();
+        assert!(went_backwards, "the head should audibly run backwards");
+        assert!(m.target.is_none(), "scrub should settle");
+        // 600 ms of playback after starting 300 ms earlier: 2.0 - 0.3 + 0.6 = 2.3 s.
+        let expect = (2.0 - 0.3 + 0.6) * sr;
+        assert!((m.pos - expect).abs() < 0.01 * sr, "landed at {} s, expected ~2.3 s", m.pos / sr);
+        assert!((m.vel - 1.0).abs() < 1e-9);
     }
 }
