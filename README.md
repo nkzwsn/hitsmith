@@ -14,15 +14,22 @@ A lightweight hitsounding workstation for osu! mappers, written in Rust.
 3. **+ Track**, choose a sample (from the project, the mapset, or your current osu! skin), then click the grid to place hits.
 4. Use the **Volume** lane to add volume points. **Export...** writes a hitsound difficulty into the mapset folder.
 
-| Action | How |
+Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the full list):
+
+| Keys | Action |
 |---|---|
-| Place / move / delete a hit | click / drag / right-click on a track |
-| Play, pause | Space |
-| Back to start | Home |
-| Undo, redo | Ctrl+Z, Ctrl+Y |
-| Zoom | Ctrl + mouse wheel |
-| Light / dark | Ctrl+T |
-| Scroll | wheel over the waveform, Shift + wheel anywhere, or the bottom slider |
+| Space / C, X, Z / V | Play or pause, play from start, jump to first / last hit |
+| Left / Right (Shift: 4x), mouse wheel | Step one snap tick, seek |
+| Up / Down | Previous / next timing or volume point |
+| Ctrl+wheel, Shift+1..9 | Change snap divisor |
+| Alt+wheel | Zoom |
+| Ctrl+Up / Down | Playback speed (25% steps, Shift: 5%) |
+| 1 / 2 | Select tool / Place tool |
+| Q / W / E / R | Toggle normal / whistle / finish / clap hit at the playhead |
+| Ctrl+A / X / C / V / D, Delete, J / K | Select all, cut, copy, paste, clone, delete, nudge |
+| Ctrl+B, Ctrl+Shift+B, Ctrl+Left / Right | Add, remove, jump between bookmarks |
+| Ctrl+Shift+P, Ctrl+I | Add / delete a volume point |
+| Ctrl+Z / Y, Ctrl+S, Ctrl+N, Esc | Undo / redo, save, remove all hits, back |
 
 **Themes:** the Theme menu has Light and Dark modes with 5 palettes each, including an osu!-style pink one.
 Colours blend smoothly when you switch. Ctrl+T flips between light and dark.

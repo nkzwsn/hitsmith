@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, Event, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::audio::{self, Engine, Event, Peaks};
+use crate::audio::{self, Engine, Event as HitEvent, Peaks};
 use crate::export;
 use crate::library;
 use crate::osu::{self, Meta, RedLine};
@@ -17,7 +17,7 @@ const HEADER_W: f32 = 290.0;
 const WAVE_H: f32 = 84.0;
 const LANE_H: f32 = 58.0;
 const ROW_H: f32 = 54.0;
-const DIVISORS: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
+const DIVISORS: [u32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16];
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -381,7 +381,10 @@ impl App {
             }
             if create {
                 let p = self.home.picked.as_ref().unwrap();
-                let proj = Project::new(p.dir.clone(), p.osu_file.clone());
+                let mut proj = Project::new(p.dir.clone(), p.osu_file.clone());
+                if let Ok(bm) = osu::read_beatmap(&p.dir.join(&p.osu_file)) {
+                    proj.bookmarks = bm.bookmarks;
+                }
                 match project::create(&self.projects_dir, &self.home.name, &proj) {
                     Ok(entry) => {
                         self.home.name.clear();
@@ -439,6 +442,17 @@ fn load_background(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHand
 }
 
 impl eframe::App for App {
+    /// Runs every frame, even while the window is minimized (when `ui` is skipped).
+    /// Keeping repaints going during playback means the playhead is in sync the
+    /// moment the window comes back, instead of freezing until the next mouse move.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.engine.as_ref().is_some_and(|e| e.is_playing()) {
+            let hidden = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+            // While minimized nothing is drawn, so a slow tick is enough to stay alive.
+            ctx.request_repaint_after(Duration::from_millis(if hidden { 100 } else { 16 }));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::T)) {
@@ -500,10 +514,22 @@ struct LoadedSong {
 }
 
 enum Drag {
-    Note { track: usize, orig: i64, cur: i64 },
+    /// Moving the selection; `delta` is the snapped offset from where the drag began.
+    Notes { anchor: i64, delta: i64 },
+    /// Rubber-band selection in screen coordinates.
+    Box { start: Pos2, cur: Pos2 },
     Point { idx: usize, orig: ControlPoint, cur: ControlPoint },
     Pan { start_view: f64 },
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Select,
+    Place,
+}
+
+/// A hit is identified by its track id and time.
+type NoteKey = (u64, i64);
 
 struct Work {
     entry: ProjectEntry,
@@ -530,6 +556,18 @@ struct Work {
     follow: bool,
     skin_dir: Option<PathBuf>,
     pal: Palette,
+    tool: Tool,
+    selected: HashSet<NoteKey>,
+    clipboard: Vec<NoteKey>,
+    speed: f64,
+    wheel_acc: f32,
+    div_acc: f32,
+    /// Visible time span (ms) of the timeline, from the last frame.
+    view_span: f64,
+    /// Track lane rectangles from the last frame, for box selection across rows.
+    row_rects: Vec<(usize, Rect)>,
+    show_keys: bool,
+    confirm_clear: bool,
 }
 
 impl Work {
@@ -574,10 +612,21 @@ impl Work {
             save_error: None,
             follow: true,
             pal: theme::DARK[0],
+            tool: Tool::Place,
+            selected: HashSet::new(),
+            clipboard: Vec::new(),
+            speed: 1.0,
+            wheel_acc: 0.0,
+            div_acc: 0.0,
+            view_span: 5000.0,
+            row_rects: Vec::new(),
+            show_keys: false,
+            confirm_clear: false,
         };
         if let Some(e) = engine {
             e.set_song(Arc::new(Vec::new()));
             e.set_samples(Vec::new());
+            e.set_speed(1.0);
             e.seek_ms(0.0);
         }
         w.refresh_library();
@@ -629,7 +678,7 @@ impl Work {
             let Some(id) = self.ensure_sample(&path, Some(engine)) else { continue };
             for &n in &t.notes {
                 let gain = t.volume as f32 / 100.0 * self.project.volume_at(n) as f32 / 100.0;
-                events.push(Event { frame: (n.max(0) as f64 * rate / 1000.0) as u64, sample: id, gain });
+                events.push(HitEvent { frame: (n.max(0) as f64 * rate / 1000.0) as u64, sample: id, gain });
             }
         }
         events.sort_by_key(|e| e.frame);
@@ -730,39 +779,10 @@ impl Work {
         }
         let mut go_home = false;
 
-        // Keyboard shortcuts (ignored while typing in a text field).
+        // osu!-editor style keyboard shortcuts (ignored while typing in a text field).
         let typing = ctx.memory(|m| m.focused()).is_some() && ctx.egui_wants_keyboard_input();
-        if !typing {
-            let (space, undo, redo, save, home) = ui.input(|i| {
-                let cmd = i.modifiers.command;
-                (
-                    i.key_pressed(Key::Space),
-                    cmd && i.key_pressed(Key::Z) && !i.modifiers.shift,
-                    cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
-                    cmd && i.key_pressed(Key::S),
-                    i.key_pressed(Key::Home),
-                )
-            });
-            if space {
-                if let Some(e) = engine {
-                    e.play(!playing);
-                }
-            }
-            if undo {
-                self.undo(engine);
-            }
-            if redo {
-                self.redo(engine);
-            }
-            if save {
-                self.save_now();
-            }
-            if home {
-                if let Some(e) = engine {
-                    e.seek_ms(0.0);
-                }
-                self.view_start = -500.0;
-            }
+        if !typing && self.handle_keys(&ctx, engine, playing, pos) {
+            go_home = true;
         }
 
         egui::Panel::top("work-top").show(ui, |ui| {
@@ -795,7 +815,13 @@ impl Work {
                     self.redo(engine);
                 }
                 ui.separator();
-                ui.label("Snap");
+                if ui.selectable_label(self.tool == Tool::Select, "Select").on_hover_text("Select and move hits (1)").clicked() {
+                    self.tool = Tool::Select;
+                }
+                if ui.selectable_label(self.tool == Tool::Place, "Place").on_hover_text("Click the grid to place hits (2)").clicked() {
+                    self.tool = Tool::Place;
+                }
+                ui.separator();
                 egui::ComboBox::from_id_salt("div").width(60.0).selected_text(format!("1/{}", self.project.divisor)).show_ui(ui, |ui| {
                     for d in DIVISORS {
                         if ui.selectable_label(self.project.divisor == d, format!("1/{d}")).clicked() {
@@ -813,6 +839,9 @@ impl Work {
                 ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     theme_ui(ui);
+                    if ui.button("Keys").on_hover_text("Keyboard shortcuts (osu! editor style)").clicked() {
+                        self.show_keys = !self.show_keys;
+                    }
                     if ui.button("Export…").clicked() {
                         self.export_open = true;
                         self.export_result = None;
@@ -844,10 +873,14 @@ impl Work {
                     self.view_start = v;
                     self.follow = false;
                 }
+                let speed_text = format!("Speed {:.0}%", self.speed * 100.0);
+                if ui.add(egui::Button::new(speed_text).frame(false)).on_hover_text("Ctrl+Up/Down: 25% steps, Ctrl+Shift+Up/Down: 5%. Click to reset.").clicked() {
+                    self.set_speed(1.0, engine);
+                }
                 ui.label("Zoom");
                 let mut z = self.project.zoom;
                 ui.spacing_mut().slider_width = 120.0;
-                if ui.add(egui::Slider::new(&mut z, 0.02..=2.0).logarithmic(true).show_value(false)).on_hover_text("Ctrl + mouse wheel also zooms").changed() {
+                if ui.add(egui::Slider::new(&mut z, 0.02..=2.0).logarithmic(true).show_value(false)).on_hover_text("Alt + mouse wheel also zooms").changed() {
                     self.project.zoom = z;
                     self.dirty = true;
                 }
@@ -876,29 +909,57 @@ impl Work {
             let lane_right = (full.right() - 14.0).max(timeline_left + 100.0);
             let grid_w = lane_right - timeline_left;
 
-            // Ctrl+wheel zoom around the mouse, wheel pans over the top lanes, shift+wheel pans anywhere.
-            let (zoom_delta, scroll, hover, shift) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta(), i.pointer.hover_pos(), i.modifiers.shift));
-            if let Some(h) = hover {
-                if full.contains(h) && h.x > timeline_left {
-                    let tr = Rect::from_min_size(pos2(timeline_left, full.top()), vec2(grid_w, full.height()));
-                    if zoom_delta != 1.0 {
+            // Mouse wheel over the timeline works like the osu! editor:
+            // wheel seeks (Shift = 4x), Ctrl+wheel changes snap, Alt+wheel zooms.
+            // Raw wheel events are counted in notches so one notch = one step.
+            self.view_span = grid_w as f64 / self.project.zoom as f64;
+            let hover = ui.input(|i| i.pointer.hover_pos());
+            if let Some(h) = hover.filter(|h| full.contains(*h) && h.x > timeline_left) {
+                let notches: Vec<(f32, Modifiers)> = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            Event::MouseWheel { unit, delta, modifiers, .. } => {
+                                // Wheel up / away from you is positive y.
+                                let d = delta.y + delta.x;
+                                let n = match unit {
+                                    egui::MouseWheelUnit::Line => d,
+                                    egui::MouseWheelUnit::Point => d / 40.0,
+                                    egui::MouseWheelUnit::Page => d * 3.0,
+                                };
+                                Some((n, *modifiers))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                let tr = Rect::from_min_size(pos2(timeline_left, full.top()), vec2(grid_w, full.height()));
+                for (n, m) in notches {
+                    if m.command {
+                        // Wheel up = finer snap (1/4 -> 1/6), down = coarser.
+                        self.div_acc += n;
+                        while self.div_acc.abs() >= 1.0 {
+                            let up = self.div_acc > 0.0;
+                            self.div_acc -= 1.0f32.copysign(self.div_acc);
+                            self.step_divisor(up);
+                        }
+                    } else if m.alt {
                         let anchor = self.t_of(tr, h.x);
-                        self.project.zoom = (self.project.zoom * zoom_delta).clamp(0.02, 2.0);
+                        self.project.zoom = (self.project.zoom * (n * 0.18).exp()).clamp(0.02, 2.0);
                         self.view_start = anchor - ((h.x - tr.left()) / self.project.zoom) as f64;
                         self.dirty = true;
-                    }
-                    let over_top = h.y < full.top() + WAVE_H + LANE_H + 8.0;
-                    let dx = if shift { scroll.x + scroll.y } else if over_top { scroll.y + scroll.x } else { scroll.x };
-                    if dx != 0.0 {
-                        self.view_start -= (dx / self.project.zoom) as f64;
-                        self.follow = false;
-                        ui.input_mut(|i| {
-                            if shift || over_top {
-                                i.smooth_scroll_delta = Vec2::ZERO;
-                            }
-                        });
+                    } else {
+                        self.wheel_acc += n;
+                        let mult = if m.shift { 4 } else { 1 };
+                        while self.wheel_acc.abs() >= 1.0 {
+                            let forward = self.wheel_acc < 0.0;
+                            self.wheel_acc -= 1.0f32.copysign(self.wheel_acc);
+                            self.seek_ticks(engine, if forward { mult } else { -mult });
+                        }
                     }
                 }
+                // Keep egui from also scrolling the track list or zooming.
+                ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
             }
             if playing && self.follow {
                 let span = grid_w as f64 / self.project.zoom as f64;
@@ -949,6 +1010,7 @@ impl Work {
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let count = self.project.content.tracks.len();
+                let mut rects = Vec::with_capacity(count);
                 for ti in 0..count {
                     let id = self.project.content.tracks[ti].id;
                     let (header, rect, resp) = lane_row(ui, ("track", id), ROW_H, timeline_left, lane_right);
@@ -957,9 +1019,11 @@ impl Work {
                         ui.shrink_clip_rect(header);
                         self.track_header(ui, ti, engine);
                     }
+                    rects.push((ti, rect));
                     self.track_lane(ui, ti, rect, &resp, pos, engine);
                     ui.add_space(2.0);
                 }
+                self.row_rects = rects;
             });
         });
 
@@ -985,6 +1049,52 @@ impl Work {
             });
             if close {
                 self.confirm_remove = None;
+            }
+        }
+
+        if self.show_keys {
+            let mut open = true;
+            egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).default_width(460.0).show(&ctx, |ui| {
+                ui.label(egui::RichText::new("Same keys as the osu! editor where they make sense.").weak());
+                egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                    for (group, rows) in SHORTCUTS {
+                        ui.add_space(6.0);
+                        ui.strong(*group);
+                        egui::Grid::new(*group).num_columns(2).spacing([18.0, 3.0]).show(ui, |ui| {
+                            for (k, what) in rows.iter() {
+                                ui.label(egui::RichText::new(*k).monospace());
+                                ui.label(*what);
+                                ui.end_row();
+                            }
+                        });
+                    }
+                });
+            });
+            self.show_keys = open;
+        }
+
+        if self.confirm_clear {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("confirm-clear")).show(&ctx, |ui| {
+                ui.heading("Remove all hits?");
+                ui.label("Every hit on every track will be removed. Tracks and volume points stay. You can undo this.");
+                ui.horizontal(|ui| {
+                    if ui.button("Remove all").clicked() {
+                        self.checkpoint();
+                        for t in &mut self.project.content.tracks {
+                            t.notes.clear();
+                        }
+                        self.selected.clear();
+                        self.changed(engine);
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.confirm_clear = false;
             }
         }
 
@@ -1165,6 +1275,14 @@ impl Work {
                 x += 1.0;
             }
         }
+        for &b in &self.project.bookmarks {
+            let x = self.x_of(rect, b as f64);
+            if rect.x_range().contains(x) {
+                painter.vline(x, rect.y_range(), Stroke::new(1.5, self.pal.accent.gamma_multiply(0.8)));
+                let tri = vec![pos2(x - 5.0, rect.top()), pos2(x + 5.0, rect.top()), pos2(x, rect.top() + 7.0)];
+                painter.add(egui::Shape::convex_polygon(tri, self.pal.accent, Stroke::NONE));
+            }
+        }
         self.draw_playhead(&painter, rect, pos);
 
         if resp.drag_started() {
@@ -1292,42 +1410,50 @@ impl Work {
     fn track_lane(&mut self, ui: &mut egui::Ui, ti: usize, rect: Rect, resp: &egui::Response, pos: f64, engine: Option<&Engine>) {
         let painter = ui.painter_at(rect);
         let track = &self.project.content.tracks[ti];
+        let tid = track.id;
         let color = self.pal.tracks[track.color as usize % 8];
         let dim = !self.project.audible(track);
         painter.rect_filled(rect, CornerRadius::same(4), self.pal.lane);
         self.draw_grid(&painter, rect, false);
         let t0 = self.t_of(rect, rect.left() - 10.0) as i64;
         let t1 = self.t_of(rect, rect.right() + 10.0) as i64;
-        let dragging = match &self.drag {
-            Some(Drag::Note { track, orig, cur }) if *track == ti => Some((*orig, *cur)),
-            _ => None,
+        let delta = match &self.drag {
+            Some(Drag::Notes { delta, .. }) => *delta,
+            _ => 0,
         };
-        let start = track.notes.partition_point(|&n| n < t0);
         let fillc = if dim { color.gamma_multiply(0.35) } else { color };
         let h = rect.height() - 14.0;
-        for &n in &track.notes[start..] {
-            if n > t1 {
+        let notes = &track.notes;
+        let start = notes.partition_point(|&n| n < t0 - delta.abs());
+        for &n in &notes[start..] {
+            if n > t1 + delta.abs() {
                 break;
             }
-            let shown = match dragging {
-                Some((o, c)) if o == n => c,
-                _ => n,
-            };
+            let sel = self.selected.contains(&(tid, n));
+            let shown = if sel { n + delta } else { n };
             let x = self.x_of(rect, shown as f64);
-            let r = Rect::from_center_size(pos2(x, rect.center().y), vec2(9.0, h));
+            let r = Rect::from_center_size(pos2(x, rect.center().y), vec2(if sel { 11.0 } else { 9.0 }, h));
             painter.rect_filled(r, CornerRadius::same(3), fillc);
-            painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_black_alpha(120)), StrokeKind::Inside);
+            if sel {
+                painter.rect_stroke(r.expand(1.5), CornerRadius::same(4), Stroke::new(2.0, self.pal.text), StrokeKind::Outside);
+            } else {
+                painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_black_alpha(120)), StrokeKind::Inside);
+            }
         }
-        if let Some((_, c)) = dragging {
-            let x = self.x_of(rect, c as f64);
-            painter.vline(x, rect.y_range(), Stroke::new(1.0, self.pal.text));
+        // Rubber band.
+        if let Some(Drag::Box { start, cur }) = &self.drag {
+            let b = Rect::from_two_pos(*start, *cur).intersect(rect);
+            if b.is_positive() {
+                painter.rect_filled(b, 0.0, self.pal.accent.gamma_multiply(0.15));
+                painter.rect_stroke(b, 0.0, Stroke::new(1.0, self.pal.accent), StrokeKind::Inside);
+            }
         }
-        // Hover ghost for the snapped position.
-        if self.drag.is_none() {
-            if let Some(h) = resp.hover_pos() {
-                let t = self.snap(self.t_of(rect, h.x));
+        // Hover ghost for the snapped position (Place tool).
+        if self.drag.is_none() && self.tool == Tool::Place {
+            if let Some(hp) = resp.hover_pos() {
+                let t = self.snap(self.t_of(rect, hp.x));
                 let x = self.x_of(rect, t as f64);
-                painter.rect_stroke(Rect::from_center_size(pos2(x, rect.center().y), vec2(9.0, rect.height() - 14.0)), CornerRadius::same(3), Stroke::new(1.0, color.gamma_multiply(0.6)), StrokeKind::Inside);
+                painter.rect_stroke(Rect::from_center_size(pos2(x, rect.center().y), vec2(9.0, h)), CornerRadius::same(3), Stroke::new(1.0, color.gamma_multiply(0.6)), StrokeKind::Inside);
             }
         }
         self.draw_playhead(&painter, rect, pos);
@@ -1339,51 +1465,81 @@ impl Work {
             let i = notes.partition_point(|&n| (n as f64) < t - tol);
             notes.get(i).copied().filter(|&n| ((n as f64) - t).abs() <= tol)
         };
+        let ctrl = ui.input(|i| i.modifiers.command);
+        let shift = ui.input(|i| i.modifiers.shift);
+
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some(n) = near(self, p) {
-                    self.drag = Some(Drag::Note { track: ti, orig: n, cur: n });
+                    if !self.selected.contains(&(tid, n)) {
+                        if !ctrl {
+                            self.selected.clear();
+                        }
+                        self.selected.insert((tid, n));
+                    }
+                    self.drag = Some(Drag::Notes { anchor: n, delta: 0 });
+                } else if self.tool == Tool::Select {
+                    if !ctrl {
+                        self.selected.clear();
+                    }
+                    self.drag = Some(Drag::Box { start: p, cur: p });
                 }
             }
         }
         if let Some(p) = resp.interact_pointer_pos() {
-            let snapped = self.snap(self.t_of(rect, p.x)).max(0);
-            if let Some(Drag::Note { track, cur, .. }) = &mut self.drag {
-                if *track == ti {
-                    *cur = snapped;
-                }
+            let raw = self.t_of(rect, p.x);
+            // Shift while dragging ignores the snap divisor, like osu!.
+            let target = if shift { raw.round() as i64 } else { self.snap(raw) };
+            match &mut self.drag {
+                Some(Drag::Notes { anchor, delta }) if resp.dragged() => *delta = target - *anchor,
+                Some(Drag::Box { cur, .. }) if resp.dragged() => *cur = p,
+                _ => {}
             }
         }
         if resp.drag_stopped() {
-            if let Some(Drag::Note { track, orig, cur }) = self.drag.take() {
-                if track == ti && orig != cur && !self.project.content.tracks[ti].notes.contains(&cur) {
-                    self.checkpoint();
-                    let t = &mut self.project.content.tracks[ti];
-                    t.remove_note(orig);
-                    t.insert_note(cur);
-                    self.changed(engine);
+            match self.drag.take() {
+                Some(Drag::Notes { delta, .. }) if delta != 0 => self.move_selection(delta, engine),
+                Some(Drag::Box { start, cur }) => {
+                    let b = Rect::from_two_pos(start, cur);
+                    let rows = self.row_rects.clone();
+                    for (row, r) in rows {
+                        if row >= self.project.content.tracks.len() || !(r.top() < b.bottom() && r.bottom() > b.top()) {
+                            continue;
+                        }
+                        let (lo, hi) = (self.t_of(r, b.left()), self.t_of(r, b.right()));
+                        let t = &self.project.content.tracks[row];
+                        for &n in &t.notes {
+                            if (n as f64) >= lo && (n as f64) <= hi {
+                                self.selected.insert((t.id, n));
+                            }
+                        }
+                    }
                 }
+                _ => {}
             }
         }
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                if near(self, p).is_none() {
+                if let Some(n) = near(self, p) {
+                    if ctrl {
+                        if !self.selected.remove(&(tid, n)) {
+                            self.selected.insert((tid, n));
+                        }
+                    } else {
+                        self.selected.clear();
+                        self.selected.insert((tid, n));
+                    }
+                    self.audition_track(ti, n, engine);
+                } else if self.tool == Tool::Place {
                     let t = self.snap(self.t_of(rect, p.x));
                     if t >= 0 && (t as f64) <= self.duration() {
                         self.checkpoint();
                         self.project.content.tracks[ti].insert_note(t);
                         self.changed(engine);
-                        let tr = self.project.content.tracks[ti].clone();
-                        if let Some(s) = &tr.sample {
-                            if let (Some(path), Some(e)) = (self.sample_path(s), engine) {
-                                if let Some(id) = self.ensure_sample(&path, Some(e)) {
-                                    if !e.is_playing() {
-                                        e.audition(id, tr.volume as f32 / 100.0 * self.project.volume_at(t) as f32 / 100.0);
-                                    }
-                                }
-                            }
-                        }
+                        self.audition_track(ti, t, engine);
                     }
+                } else if !ctrl {
+                    self.selected.clear();
                 }
             }
         }
@@ -1392,12 +1548,19 @@ impl Work {
                 if let Some(n) = near(self, p) {
                     self.checkpoint();
                     self.project.content.tracks[ti].remove_note(n);
+                    self.selected.remove(&(tid, n));
                     self.changed(engine);
                 }
             }
         }
-        if resp.hovered() {
-            let hint = if self.project.content.tracks[ti].sample.is_none() { "Pick a sample for this track first" } else { "Click: add · drag: move · right-click: delete" };
+        if resp.hovered() && self.drag.is_none() {
+            let hint = if self.project.content.tracks[ti].sample.is_none() {
+                "Pick a sample for this track first"
+            } else if self.tool == Tool::Place {
+                "Click: add · drag: move · right-click: delete · 1: Select tool"
+            } else {
+                "Click: select · drag: box select or move · Ctrl: add to selection · 2: Place tool"
+            };
             resp.clone().on_hover_text_at_pointer(hint);
         }
         if let Some(path) = self.project.content.tracks[ti].sample.as_ref().and_then(|s| self.sample_path(s)) {
@@ -1407,6 +1570,419 @@ impl Work {
         } else if let Some(s) = &self.project.content.tracks[ti].sample {
             painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Missing sample: {}", s.file), FontId::proportional(11.0), self.pal.danger);
         }
+    }
+}
+
+const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    ("Playback", &[
+        ("Space / C", "Play or pause"),
+        ("X", "Play from the start"),
+        ("Z / V", "Jump to first / last hit"),
+        ("Left / Right", "Step one snap tick (Shift: 4 ticks)"),
+        ("Up / Down", "Previous / next timing or volume point"),
+        ("Mouse wheel", "Seek (Shift: 4x)"),
+        ("Ctrl+Up / Down", "Playback speed -/+ 25% (add Shift: 5%)"),
+    ]),
+    ("Snap and zoom", &[
+        ("Ctrl+wheel", "Change snap divisor"),
+        ("Shift+1..9", "Snap 1/1 to 1/9"),
+        ("Ctrl+M", "Next snap divisor"),
+        ("Alt+wheel", "Zoom the timeline"),
+    ]),
+    ("Editing", &[
+        ("1 / 2", "Select tool / Place tool"),
+        ("Q / W / E / R", "Toggle normal / whistle / finish / clap hit at the playhead"),
+        ("Ctrl+A", "Select all hits"),
+        ("Ctrl+X / C / V", "Cut / copy / paste at the playhead"),
+        ("Ctrl+D", "Clone selection one measure later"),
+        ("J / K", "Nudge selection back / forward one tick"),
+        ("Delete", "Delete selection"),
+        ("Shift (dragging)", "Ignore snap"),
+        ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
+        ("Ctrl+N", "Remove all hits (asks first)"),
+    ]),
+    ("Points and bookmarks", &[
+        ("Ctrl+Shift+P", "Add volume point at the playhead"),
+        ("Ctrl+I", "Delete the volume point in effect"),
+        ("Ctrl+B", "Add bookmark"),
+        ("Ctrl+Shift+B", "Remove bookmark at the playhead"),
+        ("Ctrl+Left / Right", "Previous / next bookmark"),
+    ]),
+    ("General", &[
+        ("Ctrl+S", "Save now (also autosaves)"),
+        ("Esc", "Close dialog, or back to projects"),
+        ("Ctrl+T", "Switch light / dark"),
+    ]),
+];
+
+/// Consume a key press whose modifiers match exactly. Also matches the physical
+/// key, so Shift+1 works even though the logical key is "!".
+fn take_key(ctx: &egui::Context, mods: Modifiers, key: Key) -> bool {
+    ctx.input_mut(|i| {
+        let mut hit = false;
+        i.events.retain(|e| {
+            if let Event::Key { key: k, physical_key, pressed: true, modifiers: m, .. } = e {
+                if !hit && (*k == key || *physical_key == Some(key)) && m.matches_exact(mods) {
+                    hit = true;
+                    return false;
+                }
+            }
+            true
+        });
+        hit
+    })
+}
+
+impl Work {
+    /// Handles all editor shortcuts. Returns true to go back to the project list.
+    fn handle_keys(&mut self, ctx: &egui::Context, engine: Option<&Engine>, playing: bool, pos: f64) -> bool {
+        let none = Modifiers::NONE;
+        let shift = Modifiers::SHIFT;
+        let cmd = Modifiers::COMMAND;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let k = |m: Modifiers, key: Key| take_key(ctx, m, key);
+
+        // Transport.
+        if k(none, Key::Space) || k(none, Key::C) {
+            if let Some(e) = engine {
+                e.play(!playing);
+            }
+        }
+        if k(none, Key::X) {
+            self.seek(engine, 0.0);
+            if let Some(e) = engine {
+                e.play(true);
+            }
+        }
+        if k(none, Key::Z) {
+            let first = self.project.content.tracks.iter().filter_map(|t| t.notes.first()).min().copied();
+            self.seek(engine, first.map(|t| t as f64).unwrap_or(0.0));
+        }
+        if k(none, Key::V) {
+            let last = self.project.content.tracks.iter().filter_map(|t| t.notes.last()).max().copied();
+            self.seek(engine, last.map(|t| t as f64).unwrap_or(self.duration()));
+        }
+        if k(none, Key::Home) {
+            self.seek(engine, 0.0);
+        }
+        for (key, n) in [(Key::ArrowLeft, -1), (Key::ArrowRight, 1)] {
+            if k(none, key) {
+                self.seek_ticks(engine, n);
+            }
+            if k(shift, key) {
+                self.seek_ticks(engine, n * 4);
+            }
+        }
+        for (key, dir) in [(Key::ArrowUp, -1i32), (Key::ArrowDown, 1)] {
+            if k(cmd_shift, key) {
+                self.set_speed(self.speed - dir as f64 * 0.05, engine);
+            }
+            if k(cmd, key) {
+                self.set_speed(self.speed - dir as f64 * 0.25, engine);
+            }
+            if k(none, key) {
+                let mut points: Vec<f64> = self.reds.iter().map(|r| r.offset).collect();
+                points.extend(self.project.content.control_points.iter().map(|c| c.time as f64));
+                points.sort_by(f64::total_cmp);
+                let target = if dir < 0 { points.iter().rev().find(|&&t| t < pos - 1.0) } else { points.iter().find(|&&t| t > pos + 1.0) };
+                if let Some(&t) = target {
+                    self.seek(engine, t);
+                }
+            }
+        }
+
+        // Bookmarks.
+        if k(cmd_shift, Key::B) {
+            let tol = self.step_ms(pos).max(20.0);
+            let near = self.project.bookmarks.iter().position(|&b| ((b as f64) - pos).abs() <= tol);
+            if let Some(i) = near {
+                self.project.bookmarks.remove(i);
+                self.dirty = true;
+            }
+        }
+        if k(cmd, Key::B) {
+            let t = pos.round() as i64;
+            if let Err(i) = self.project.bookmarks.binary_search(&t) {
+                self.project.bookmarks.insert(i, t);
+                self.dirty = true;
+            }
+        }
+        if k(cmd, Key::ArrowLeft) {
+            if let Some(&b) = self.project.bookmarks.iter().rev().find(|&&b| (b as f64) < pos - 1.0) {
+                self.seek(engine, b as f64);
+            }
+        }
+        if k(cmd, Key::ArrowRight) {
+            if let Some(&b) = self.project.bookmarks.iter().find(|&&b| (b as f64) > pos + 1.0) {
+                self.seek(engine, b as f64);
+            }
+        }
+
+        // Snap divisor.
+        for (n, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].into_iter().enumerate() {
+            if k(shift, key) {
+                self.project.divisor = n as u32 + 1;
+                self.dirty = true;
+            }
+        }
+        if k(cmd, Key::M) {
+            self.step_divisor(true);
+        }
+
+        // Tools.
+        if k(none, Key::Num1) {
+            self.tool = Tool::Select;
+        }
+        if k(none, Key::Num2) {
+            self.tool = Tool::Place;
+        }
+
+        // Undo, save, clear.
+        if k(cmd_shift, Key::Z) || k(cmd, Key::Y) {
+            self.redo(engine);
+        }
+        if k(cmd, Key::Z) {
+            self.undo(engine);
+        }
+        if k(cmd, Key::S) {
+            self.save_now();
+        }
+        if k(cmd, Key::N) {
+            self.confirm_clear = true;
+        }
+
+        // Selection and clipboard.
+        if k(cmd, Key::A) {
+            self.selected = self.project.content.tracks.iter().flat_map(|t| t.notes.iter().map(move |&n| (t.id, n))).collect();
+        }
+        if k(cmd, Key::C) {
+            self.copy_selection();
+        }
+        if k(cmd, Key::X) {
+            self.copy_selection();
+            self.delete_selection(engine);
+        }
+        if k(cmd, Key::V) {
+            let at = self.snap(pos).max(0);
+            self.paste_at(at, engine);
+        }
+        if k(cmd, Key::D) {
+            self.clone_selection(engine);
+        }
+        if k(none, Key::Delete) || k(none, Key::Backspace) {
+            self.delete_selection(engine);
+        }
+        if k(none, Key::J) {
+            self.nudge_selection(-1, engine);
+        }
+        if k(none, Key::K) {
+            self.nudge_selection(1, engine);
+        }
+
+        // Hitsound keys: toggle a hit at the playhead on the matching track.
+        for (key, kind, fallback) in [(Key::Q, "normal", 0usize), (Key::W, "whistle", 1), (Key::E, "finish", 2), (Key::R, "clap", 3)] {
+            if k(none, key) {
+                self.toggle_kind_at(kind, fallback, pos, engine);
+            }
+        }
+
+        // Volume points.
+        if k(cmd_shift, Key::P) {
+            let t = self.snap(pos).max(0);
+            if !self.project.content.control_points.iter().any(|c| c.time == t) {
+                self.checkpoint();
+                let v = self.project.volume_at(t);
+                self.project.content.control_points.push(ControlPoint { time: t, volume: v });
+                self.project.content.control_points.sort_by_key(|c| c.time);
+                self.changed(engine);
+            }
+        }
+        if k(cmd, Key::I) {
+            let cps = &self.project.content.control_points;
+            let i = cps.partition_point(|c| (c.time as f64) <= pos + 0.5);
+            if i >= 2 {
+                self.checkpoint();
+                self.project.content.control_points.remove(i - 1);
+                self.changed(engine);
+            }
+        }
+
+        if k(none, Key::Escape) {
+            if self.show_keys || self.export_open || self.confirm_clear || self.confirm_remove.is_some() {
+                self.show_keys = false;
+                self.export_open = false;
+                self.confirm_clear = false;
+                self.confirm_remove = None;
+            } else if !self.selected.is_empty() {
+                self.selected.clear();
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn step_ms(&self, t: f64) -> f64 {
+        osu::red_line_at(&self.reds, t).beat_length / self.project.divisor as f64
+    }
+
+    /// Ctrl+wheel / Ctrl+M step through the usual osu! divisors (1/5, 1/7, 1/9 only via Shift+number).
+    fn step_divisor(&mut self, finer: bool) {
+        const STEPS: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
+        let cur = self.project.divisor;
+        let next = if finer { STEPS.iter().find(|&&d| d > cur).copied() } else { STEPS.iter().rev().find(|&&d| d < cur).copied() };
+        if let Some(d) = next {
+            self.project.divisor = d;
+            self.dirty = true;
+        }
+    }
+
+    fn set_speed(&mut self, speed: f64, engine: Option<&Engine>) {
+        // Round to 5% so repeated steps don't drift.
+        self.speed = ((speed.clamp(0.25, 1.0) * 20.0).round()) / 20.0;
+        if let Some(e) = engine {
+            e.set_speed(self.speed);
+        }
+    }
+
+    /// Seek and keep the playhead on screen.
+    fn seek(&mut self, engine: Option<&Engine>, t: f64) {
+        let t = t.clamp(0.0, self.duration());
+        if let Some(e) = engine {
+            e.seek_ms(t);
+        }
+        if t < self.view_start || t > self.view_start + self.view_span * 0.9 {
+            self.view_start = t - self.view_span * 0.25;
+        }
+    }
+
+    fn seek_ticks(&mut self, engine: Option<&Engine>, n: i32) {
+        let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        let mut t = osu::snap(&self.reds, pos, self.project.divisor);
+        // From between two ticks, the first step lands on the neighbouring tick.
+        let mut steps = n.abs();
+        if (t - pos).abs() > 1.0 && ((n > 0 && t > pos) || (n < 0 && t < pos)) {
+            steps -= 1;
+        }
+        for _ in 0..steps {
+            t = osu::snap(&self.reds, t + n.signum() as f64 * self.step_ms(t), self.project.divisor);
+        }
+        self.seek(engine, t);
+    }
+
+    fn audition_track(&mut self, ti: usize, t: i64, engine: Option<&Engine>) {
+        let tr = self.project.content.tracks[ti].clone();
+        let Some(s) = &tr.sample else { return };
+        if let (Some(path), Some(e)) = (self.sample_path(s), engine) {
+            if let Some(id) = self.ensure_sample(&path, Some(e)) {
+                if !e.is_playing() {
+                    e.audition(id, tr.volume as f32 / 100.0 * self.project.volume_at(t) as f32 / 100.0);
+                }
+            }
+        }
+    }
+
+    fn track_index(&self, id: u64) -> Option<usize> {
+        self.project.content.tracks.iter().position(|t| t.id == id)
+    }
+
+    fn move_selection(&mut self, delta: i64, engine: Option<&Engine>) {
+        if self.selected.is_empty() || delta == 0 {
+            return;
+        }
+        let dur = self.duration() as i64;
+        let moved: Vec<NoteKey> = self.selected.iter().map(|&(id, t)| (id, t + delta)).collect();
+        if moved.iter().any(|&(_, t)| t < 0 || t > dur) {
+            return;
+        }
+        self.checkpoint();
+        let old: Vec<NoteKey> = self.selected.drain().collect();
+        for &(id, t) in &old {
+            if let Some(ti) = self.track_index(id) {
+                self.project.content.tracks[ti].remove_note(t);
+            }
+        }
+        for &(id, t) in &moved {
+            if let Some(ti) = self.track_index(id) {
+                self.project.content.tracks[ti].insert_note(t);
+                self.selected.insert((id, t));
+            }
+        }
+        self.changed(engine);
+    }
+
+    fn nudge_selection(&mut self, dir: i64, engine: Option<&Engine>) {
+        let Some(&(_, first)) = self.selected.iter().min_by_key(|k| k.1) else { return };
+        let target = osu::snap(&self.reds, first as f64 + dir as f64 * self.step_ms(first as f64), self.project.divisor).round() as i64;
+        self.move_selection(target - first, engine);
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(min) = self.selected.iter().map(|k| k.1).min() else { return };
+        self.clipboard = self.selected.iter().map(|&(id, t)| (id, t - min)).collect();
+    }
+
+    fn delete_selection(&mut self, engine: Option<&Engine>) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for (id, t) in self.selected.drain().collect::<Vec<_>>() {
+            if let Some(ti) = self.track_index(id) {
+                self.project.content.tracks[ti].remove_note(t);
+            }
+        }
+        self.changed(engine);
+    }
+
+    fn paste_at(&mut self, at: i64, engine: Option<&Engine>) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let dur = self.duration() as i64;
+        self.checkpoint();
+        self.selected.clear();
+        for (id, rel) in self.clipboard.clone() {
+            let t = at + rel;
+            if t > dur {
+                continue;
+            }
+            if let Some(ti) = self.track_index(id) {
+                self.project.content.tracks[ti].insert_note(t);
+                self.selected.insert((id, t));
+            }
+        }
+        self.changed(engine);
+    }
+
+    fn clone_selection(&mut self, engine: Option<&Engine>) {
+        let (Some(min), Some(max)) = (self.selected.iter().map(|k| k.1).min(), self.selected.iter().map(|k| k.1).max()) else { return };
+        let rl = osu::red_line_at(&self.reds, min as f64);
+        let measure = rl.beat_length * rl.meter as f64;
+        let measures = (((max - min) as f64 + 1.0) / measure).ceil().max(1.0);
+        let shift = (measure * measures).round() as i64;
+        self.copy_selection();
+        self.paste_at(min + shift, engine);
+    }
+
+    /// Q/W/E/R: toggle a hit on the track whose sample is that kind of hitsound.
+    fn toggle_kind_at(&mut self, kind: &str, fallback: usize, pos: f64, engine: Option<&Engine>) {
+        let tracks = &self.project.content.tracks;
+        let ti = tracks
+            .iter()
+            .position(|t| t.sample.as_ref().is_some_and(|s| s.file.to_ascii_lowercase().contains(kind)))
+            .or_else(|| (fallback < tracks.len()).then_some(fallback));
+        let Some(ti) = ti else { return };
+        let t = self.snap(pos).max(0);
+        self.checkpoint();
+        let tid = self.project.content.tracks[ti].id;
+        if self.project.content.tracks[ti].remove_note(t) {
+            self.selected.remove(&(tid, t));
+        } else {
+            self.project.content.tracks[ti].insert_note(t);
+            self.audition_track(ti, t, engine);
+        }
+        self.changed(engine);
     }
 }
 

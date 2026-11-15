@@ -106,6 +106,8 @@ pub struct Project {
     pub divisor: u32,
     #[serde(default)]
     pub next_id: u64,
+    #[serde(default)]
+    pub bookmarks: Vec<i64>,
 }
 
 fn default_zoom() -> f32 {
@@ -126,6 +128,7 @@ impl Project {
             zoom: default_zoom(),
             divisor: default_div(),
             next_id: 1,
+            bookmarks: Vec::new(),
         }
     }
 
@@ -216,6 +219,8 @@ pub fn load(path: &Path) -> Result<Project> {
         c.volume = c.volume.clamp(5, 100);
     }
     p.divisor = p.divisor.clamp(1, 16);
+    p.bookmarks.sort_unstable();
+    p.bookmarks.dedup();
     p.next_id = p.next_id.max(p.content.tracks.iter().map(|t| t.id + 1).max().unwrap_or(1));
     Ok(p)
 }

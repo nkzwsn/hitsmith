@@ -222,6 +222,10 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
     // 7. Write the difficulty from the source as a template.
     let mut text = osu::set_value(&source.text, "Metadata", "Version", diff_name);
     text = osu::set_value(&text, "Metadata", "BeatmapID", "0");
+    if !project.bookmarks.is_empty() {
+        let marks: Vec<String> = project.bookmarks.iter().map(|b| b.to_string()).collect();
+        text = osu::set_value(&text, "Editor", "Bookmarks", &marks.join(","));
+    }
     text = osu::replace_section(&text, "TimingPoints", &timing.join("\r\n"));
     text = osu::replace_section(&text, "HitObjects", &objects.join("\r\n"));
     let osu_tmp = dir.join(format!("{osu_name}.tmp"));

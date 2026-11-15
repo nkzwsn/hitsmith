@@ -43,7 +43,29 @@ impl RedLine {
 pub struct Beatmap {
     pub meta: Meta,
     pub red_lines: Vec<RedLine>,
+    /// Editor bookmarks (ms) from the [Editor] section.
+    pub bookmarks: Vec<i64>,
     pub text: String,
+}
+
+fn parse_bookmarks(text: &str) -> Vec<i64> {
+    let mut in_editor = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_editor = line == "[Editor]";
+            continue;
+        }
+        if in_editor {
+            if let Some(("Bookmarks", v)) = split_kv(line) {
+                let mut b: Vec<i64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                b.sort_unstable();
+                b.dedup();
+                return b;
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn read_text(path: &Path) -> Result<String> {
@@ -147,7 +169,8 @@ pub fn read_beatmap(path: &Path) -> Result<Beatmap> {
     if red_lines.is_empty() {
         bail!("{} has no BPM timing points", path.display());
     }
-    Ok(Beatmap { meta, red_lines, text })
+    let bookmarks = parse_bookmarks(&text);
+    Ok(Beatmap { meta, red_lines, bookmarks, text })
 }
 
 /// Red line in effect at `ms` (the first one also covers time before it).

@@ -148,7 +148,9 @@ struct Voice {
 #[derive(Default)]
 struct Mix {
     song: Arc<Vec<i16>>,
-    pos: u64,
+    /// Song position in frames; fractional so playback speed can change.
+    pos: f64,
+    rate: f64,
     playing: bool,
     song_gain: f32,
     hit_gain: f32,
@@ -161,7 +163,7 @@ struct Mix {
 
 impl Mix {
     fn reset_cursor(&mut self) {
-        self.cursor = self.events.partition_point(|e| e.frame < self.pos);
+        self.cursor = self.events.partition_point(|e| (e.frame as f64) < self.pos);
         self.voices.clear();
     }
 }
@@ -181,7 +183,7 @@ impl Engine {
         let config: cpal::StreamConfig = supported.into();
         let rate = config.sample_rate;
         let channels = config.channels as usize;
-        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, ..Default::default() }));
+        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, ..Default::default() }));
         let m = mix.clone();
         let err = |e| eprintln!("audio stream error: {e}");
         let stream = match format {
@@ -202,7 +204,7 @@ impl Engine {
     pub fn set_song(&self, song: Arc<Vec<i16>>) {
         self.with(|m| {
             m.song = song;
-            m.pos = 0;
+            m.pos = 0.0;
             m.playing = false;
             m.reset_cursor();
         });
@@ -216,7 +218,7 @@ impl Engine {
     pub fn set_events(&self, events: Vec<Event>) {
         self.with(|m| {
             m.events = Arc::new(events);
-            m.cursor = m.events.partition_point(|e| e.frame < m.pos);
+            m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
         });
     }
     pub fn set_gains(&self, song: f32, hits: f32) {
@@ -236,15 +238,19 @@ impl Engine {
     pub fn is_playing(&self) -> bool {
         self.with(|m| m.playing)
     }
+    /// Playback speed (1.0 = normal). Hitsounds keep their pitch; the song is resampled.
+    pub fn set_speed(&self, speed: f64) {
+        self.with(|m| m.rate = speed.clamp(0.1, 4.0));
+    }
     pub fn seek_ms(&self, ms: f64) {
-        let frame = (ms.max(0.0) * self.rate as f64 / 1000.0) as u64;
+        let frame = ms.max(0.0) * self.rate as f64 / 1000.0;
         self.with(|m| {
             m.pos = frame;
             m.reset_cursor();
         });
     }
     pub fn position_ms(&self) -> f64 {
-        self.with(|m| m.pos) as f64 * 1000.0 / self.rate as f64
+        self.with(|m| m.pos) * 1000.0 / self.rate as f64
     }
     /// Play a sample right away (auditioning), independent of the transport.
     pub fn audition(&self, sample: u32, gain: f32) {
@@ -272,21 +278,28 @@ fn render<T: Copy>(mix: &Mutex<Mix>, out: &mut [T], channels: usize, conv: impl 
     for frame in out.chunks_mut(channels) {
         let (mut l, mut r) = (0f32, 0f32);
         if m.playing {
-            while m.cursor < m.events.len() && m.events[m.cursor].frame <= m.pos {
+            while m.cursor < m.events.len() && m.events[m.cursor].frame as f64 <= m.pos {
                 let e = m.events[m.cursor];
                 if m.voices.len() < 96 {
                     m.voices.push(Voice { sample: e.sample, pos: 0, gain: e.gain });
                 }
                 m.cursor += 1;
             }
-            let i = m.pos as usize * 2;
-            if i + 1 < m.song.len() {
-                l += m.song[i] as f32 * (m.song_gain / 32768.0);
-                r += m.song[i + 1] as f32 * (m.song_gain / 32768.0);
+            let i0 = m.pos as usize;
+            let i = i0 * 2;
+            let g = m.song_gain / 32768.0;
+            if i + 3 < m.song.len() {
+                // Linear interpolation between frames for non-1x speeds.
+                let f = (m.pos - i0 as f64) as f32;
+                l += (m.song[i] as f32 + (m.song[i + 2] as f32 - m.song[i] as f32) * f) * g;
+                r += (m.song[i + 1] as f32 + (m.song[i + 3] as f32 - m.song[i + 1] as f32) * f) * g;
+            } else if i + 1 < m.song.len() {
+                l += m.song[i] as f32 * g;
+                r += m.song[i + 1] as f32 * g;
             } else if m.events.get(m.cursor).is_none() && m.voices.is_empty() {
                 m.playing = false;
             }
-            m.pos += 1;
+            m.pos += m.rate;
         }
         let hit = m.hit_gain;
         let samples = &m.samples;
