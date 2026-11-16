@@ -818,8 +818,9 @@ struct LoadedSong {
 }
 
 enum Drag {
-    /// Moving the selection; `delta` is the snapped offset from where the drag began.
-    Notes { anchor: i64, delta: i64 },
+    /// Moving the selection; `delta` is the snapped offset from where the drag began,
+    /// `rows` how many sample rows down (negative: up) it's being moved.
+    Notes { anchor: i64, delta: i64, from: usize, rows: i32 },
     /// Rubber-band selection in screen coordinates.
     Box { start: Pos2, cur: Pos2 },
     /// Dragging a volume point. `axis`: 0 = undecided, 1 = volume (vertical), 2 = time (horizontal).
@@ -2119,7 +2120,8 @@ impl Work {
         }
         // Holding the ruler while playing: fade the song out, move silently with the mouse,
         // and resume from where it's released (re-seeking every frame sounded like a skipping CD).
-        let down = resp.is_pointer_button_down_on() || resp.dragged();
+        // Left button only: a right-click opens the bar menu without moving the playhead.
+        let down = (resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down())) || resp.dragged_by(egui::PointerButton::Primary);
         if down {
             if !self.ruler_held {
                 self.ruler_held = true;
@@ -2141,9 +2143,76 @@ impl Work {
             }
             self.ruler_resume = false;
         }
+        // Bars: double-click selects every hit in that bar; right-click has bar actions.
+        if resp.double_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let add = ui.input(|i| i.modifiers.command);
+                let (a, b) = self.bar_span(self.t_of(rect, p.x));
+                let n = self.select_range(a, b, add);
+                self.toast(format!("Bar {}: {n} hits selected", osu::measure_number(&self.reds, a as f64)));
+            }
+        }
+        let menu_id = egui::Id::unique("ruler-bar-menu");
+        if resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = self.t_of(rect, p.x);
+                ui.data_mut(|d| d.insert_temp(menu_id, t));
+            }
+        }
+        resp.context_menu(|ui| {
+            let t: f64 = ui.data(|d| d.get_temp(menu_id)).unwrap_or(pos);
+            let (a, b) = self.bar_span(t);
+            let bar = osu::measure_number(&self.reds, a as f64);
+            if ui.button(format!("Select bar {bar}")).clicked() {
+                let n = self.select_range(a, b, false);
+                self.toast(format!("Bar {bar}: {n} hits selected"));
+                ui.close();
+            }
+            if ui.button(format!("Repeat bar {bar} into bar {}", bar + 1)).on_hover_text("Copies its hits one bar later and selects the copies; Ctrl+D keeps going").clicked() {
+                let n = self.select_range(a, b, false);
+                if n > 0 {
+                    self.shift_selection(b - a, 0, true, engine);
+                    self.toast(format!("Repeated bar {bar} ({n} hits). Ctrl+D repeats again"));
+                }
+                ui.close();
+            }
+            if ui.button(format!("Clear bar {bar}")).clicked() {
+                let n = self.select_range(a, b, false);
+                if n > 0 {
+                    self.delete_selection(engine);
+                    self.toast(format!("Cleared bar {bar} ({n} hits)"));
+                }
+                ui.close();
+            }
+        });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            resp.clone().on_hover_text_at_pointer("Click: seek · double-click: select the bar's hits · right-click: bar actions");
         }
+    }
+
+    /// Start and end (exclusive) of the bar containing `t`, cut short by a following red line.
+    fn bar_span(&self, t: f64) -> (i64, i64) {
+        let rl = osu::red_line_at(&self.reds, t);
+        let len = rl.beat_length * rl.meter.max(1) as f64;
+        let start = rl.offset + ((t - rl.offset) / len + 1e-6).floor() * len;
+        let next_red = self.reds.iter().map(|r| r.offset).find(|&o| o > start + 0.5).unwrap_or(f64::INFINITY);
+        (start.round() as i64, (start + len).min(next_red).round() as i64)
+    }
+
+    /// Select every hit in [a, b); returns how many. `add` keeps the current selection.
+    fn select_range(&mut self, a: i64, b: i64, add: bool) -> usize {
+        if !add {
+            self.selected.clear();
+        }
+        let mut n = 0;
+        for t in &self.project.content.tracks {
+            for &x in t.notes.iter().filter(|&&x| x >= a && x < b) {
+                self.selected.insert((t.id, x));
+                n += 1;
+            }
+        }
+        n
     }
 
     fn draw_grid(&self, painter: &egui::Painter, rect: Rect, beats_only: bool) {
@@ -2426,10 +2495,14 @@ impl Work {
         self.draw_grid(&painter, rect, false);
         let t0 = self.t_of(rect, rect.left() - 10.0) as i64;
         let t1 = self.t_of(rect, rect.right() + 10.0) as i64;
-        let delta = match &self.drag {
-            Some(Drag::Notes { delta, .. }) => *delta,
-            _ => 0,
+        let (delta, rows) = match &self.drag {
+            Some(Drag::Notes { delta, rows, .. }) => (*delta, *rows),
+            _ => (0, 0),
         };
+        // Ctrl while dragging hits copies them instead of moving: originals stay, copies follow the mouse.
+        // Dragging to another row moves (or copies) the hits to that sample.
+        let copying = (delta != 0 || rows != 0) && ui.input(|i| i.modifiers.command);
+        let ghosts = copying || rows != 0;
         let fillc = if dim { color.gamma_multiply(0.35) } else { color };
         let h = rect.height() - 14.0;
         let notes = &track.notes;
@@ -2441,7 +2514,7 @@ impl Work {
                 break;
             }
             let sel = self.selected.contains(&(tid, n));
-            let shown = if sel { n + delta } else { n };
+            let shown = if sel && !ghosts { n + delta } else { n };
             let x = self.x_of(rect, shown as f64);
             let hovered = self.drag.is_none() && hover_x.is_some_and(|hx| (hx - x).abs() < 7.0);
             // Flash for ~180 ms after the playhead passes a hit.
@@ -2453,12 +2526,26 @@ impl Work {
             }
             let w = if sel || hovered { 12.0 } else { 10.0 };
             let r = Rect::from_center_size(pos2(x, rect.center().y), vec2(w, h));
-            let fill = if hovered { fillc.lerp_to_gamma(Color32::WHITE, 0.25) } else { fillc };
+            let fill = if hovered { fillc.lerp_to_gamma(Color32::WHITE, 0.25) } else if sel && ghosts && !copying { fillc.gamma_multiply(0.3) } else { fillc };
             painter.rect_filled(r, CornerRadius::same(5), fill);
-            if sel {
+            if sel && !ghosts {
                 painter.rect_stroke(r.expand(2.0), CornerRadius::same(7), Stroke::new(2.0, self.pal.text), StrokeKind::Outside);
             } else {
                 painter.rect_stroke(r, CornerRadius::same(5), Stroke::new(1.0, Color32::from_black_alpha(90)), StrokeKind::Inside);
+            }
+        }
+        // Where dragged hits will land in this row: selected hits of the row `rows` above, shifted by `delta`.
+        if ghosts {
+            let src = ti as i64 - rows as i64;
+            if let Some(st) = usize::try_from(src).ok().and_then(|i| self.project.content.tracks.get(i)) {
+                for &n in &st.notes {
+                    if !self.selected.contains(&(st.id, n)) || n + delta < t0 || n + delta > t1 {
+                        continue;
+                    }
+                    let c = Rect::from_center_size(pos2(self.x_of(rect, (n + delta) as f64), rect.center().y), vec2(12.0, h));
+                    painter.rect_filled(c, CornerRadius::same(5), fillc.gamma_multiply(0.8));
+                    painter.rect_stroke(c.expand(2.0), CornerRadius::same(7), Stroke::new(2.0, self.pal.text), StrokeKind::Outside);
+                }
             }
         }
         // Rubber band.
@@ -2498,7 +2585,7 @@ impl Work {
                         }
                         self.selected.insert((tid, n));
                     }
-                    self.drag = Some(Drag::Notes { anchor: n, delta: 0 });
+                    self.drag = Some(Drag::Notes { anchor: n, delta: 0, from: ti, rows: 0 });
                 } else {
                     // Dragging across empty grid draws a selection box in either tool.
                     if !ctrl {
@@ -2512,15 +2599,27 @@ impl Work {
             let raw = self.t_of(rect, p.x);
             // Shift while dragging ignores the snap divisor, like osu!.
             let target = if shift { raw.round() as i64 } else { self.snap(raw) };
+            // Row under the pointer, kept only if every selected hit has a sample row to land on.
+            let over_row = self.row_rects.iter().find(|(_, r)| r.y_range().contains(p.y)).map(|(i, _)| *i);
+            let n_tracks = self.project.content.tracks.len() as i64;
+            let sel_rows: Vec<i64> = self.selected.iter().filter_map(|&(id, _)| self.track_index(id)).map(|i| i as i64).collect();
             match &mut self.drag {
-                Some(Drag::Notes { anchor, delta }) if resp.dragged() => *delta = target - *anchor,
+                Some(Drag::Notes { anchor, delta, from, rows }) if resp.dragged() => {
+                    *delta = target - *anchor;
+                    if let Some(r) = over_row {
+                        let d = r as i64 - *from as i64;
+                        if sel_rows.iter().all(|&i| (0..n_tracks).contains(&(i + d))) {
+                            *rows = d as i32;
+                        }
+                    }
+                }
                 Some(Drag::Box { cur, .. }) if resp.dragged() => *cur = p,
                 _ => {}
             }
         }
         if resp.drag_stopped() {
             match self.drag.take() {
-                Some(Drag::Notes { delta, .. }) if delta != 0 => self.move_selection(delta, engine),
+                Some(Drag::Notes { delta, rows, .. }) if delta != 0 || rows != 0 => self.shift_selection(delta, rows, ctrl, engine),
                 Some(Drag::Box { start, cur }) => {
                     let b = Rect::from_two_pos(start, cur);
                     let rows = self.row_rects.clone();
@@ -2565,6 +2664,21 @@ impl Work {
                 }
             }
         }
+        if resp.double_clicked() {
+            // Double-click a hit: select every hit of that sample (Ctrl adds to the selection).
+            if let Some(p) = resp.interact_pointer_pos() {
+                if near(self, p).is_some() {
+                    if !ctrl {
+                        self.selected.clear();
+                    }
+                    let n = self.project.content.tracks[ti].notes.len();
+                    for &t in &self.project.content.tracks[ti].notes {
+                        self.selected.insert((tid, t));
+                    }
+                    self.toast(format!("Selected all {n} hits of this sample"));
+                }
+            }
+        }
         if resp.secondary_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some(n) = near(self, p) {
@@ -2578,6 +2692,7 @@ impl Work {
         if resp.hovered() || resp.dragged() {
             let over_hit = resp.hover_pos().is_some_and(|p| near(self, p).is_some());
             let cursor = match (&self.drag, self.tool) {
+                (Some(Drag::Notes { .. }), _) if ctrl => egui::CursorIcon::Copy,
                 (Some(Drag::Notes { .. }), _) => egui::CursorIcon::Grabbing,
                 _ if over_hit => egui::CursorIcon::Grab,
                 (_, Tool::Place) => egui::CursorIcon::Crosshair,
@@ -2589,9 +2704,9 @@ impl Work {
             let hint = if self.project.content.tracks[ti].sample.is_none() {
                 "Pick a sound file for this sample first"
             } else if self.tool == Tool::Place {
-                "Click: add · drag empty space: select · drag a hit: move · right-click: delete"
+                "Click: add · drag a hit: move, also to another sample (Ctrl: copy) · right-click: delete"
             } else {
-                "Click: select · drag: box select or move · Ctrl: add to selection · 2: Place tool"
+                "Click: select · double-click: all hits of this sample · drag: move · Ctrl+drag a hit: copy"
             };
             resp.clone().on_hover_text_at_pointer(hint);
         }
@@ -2631,6 +2746,11 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ("J / K", "Nudge selection back / forward one tick"),
         ("Delete", "Delete selection"),
         ("Shift (dragging)", "Ignore snap"),
+        ("Ctrl+drag a hit", "Copy the selected hits to where you drop them"),
+        ("Drag a hit up / down", "Move the selected hits to another sample (Ctrl: copy)"),
+        ("Double-click a hit", "Select every hit of that sample"),
+        ("Double-click a bar", "Select every hit in that bar (on the ruler; Ctrl adds)"),
+        ("Right-click a bar", "Select, repeat into the next bar, or clear that bar"),
         ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
         ("Ctrl+N", "Remove all hits (asks first)"),
     ]),
@@ -3021,6 +3141,42 @@ impl Work {
                 self.project.content.tracks[ti].insert_note(t);
                 self.selected.insert((id, t));
             }
+        }
+        self.changed(engine);
+    }
+
+    /// Move (or with `copy`, duplicate) the selected hits by `delta` ms and `rows` sample rows;
+    /// the moved hits or copies become the selection.
+    fn shift_selection(&mut self, delta: i64, rows: i32, copy: bool, engine: Option<&Engine>) {
+        if self.selected.is_empty() || (delta == 0 && rows == 0) {
+            return;
+        }
+        let dur = self.duration() as i64;
+        let n = self.project.content.tracks.len() as i64;
+        let plan: Vec<(NoteKey, usize)> = self
+            .selected
+            .iter()
+            .filter_map(|&(id, t)| {
+                let to = self.track_index(id)? as i64 + rows as i64;
+                ((0..n).contains(&to) && (0..=dur).contains(&(t + delta))).then_some(((id, t), to as usize))
+            })
+            .collect();
+        if plan.len() != self.selected.len() {
+            return; // some hit would land outside the song or the sample list
+        }
+        self.checkpoint();
+        if !copy {
+            for &((id, t), _) in &plan {
+                if let Some(ti) = self.track_index(id) {
+                    self.project.content.tracks[ti].remove_note(t);
+                }
+            }
+        }
+        self.selected.clear();
+        for &((_, t), to) in &plan {
+            let track = &mut self.project.content.tracks[to];
+            track.insert_note(t + delta);
+            self.selected.insert((track.id, t + delta));
         }
         self.changed(engine);
     }

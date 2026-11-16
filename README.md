@@ -30,6 +30,10 @@ Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the
 | 1 / 2 | Select tool / Place tool |
 | Sample keys (default Q / W / E / R) | Toggle a hit at the playhead on that sample; click a sample's key cap to change it |
 | Ctrl+A / X / C / V / D, Delete, J / K | Select all, cut, copy, paste, clone, delete, nudge |
+| Ctrl+drag a hit | Copy the selected hits to where you drop them |
+| Drag a hit up / down | Move the selected hits to another sample (Ctrl: copy) |
+| Double-click a hit | Select every hit of that sample |
+| Double-click / right-click a bar on the ruler | Select its hits / select, repeat into the next bar, or clear |
 | Ctrl+B, Ctrl+Shift+B, Ctrl+Left / Right | Add, remove, jump between bookmarks |
 | Ctrl+Shift+P, Ctrl+I | Add / delete a volume point |
 | Ctrl+Z / Y, Ctrl+S, Ctrl+N, Esc | Undo / redo, save, remove all hits, back |
