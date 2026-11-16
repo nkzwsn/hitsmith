@@ -823,6 +823,7 @@ dependencies = [
  "eframe",
  "hound",
  "image",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",

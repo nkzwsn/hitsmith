@@ -45,6 +45,10 @@ pub struct Track {
     pub color: u8,
     /// Sorted, unique note times in milliseconds.
     pub notes: Vec<i64>,
+    /// Key that toggles a hit at the playhead on this track.
+    /// `None` = use the default (Q/W/E/R), `Some("")` = no key, otherwise an egui key name.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 impl Track {
@@ -381,5 +385,92 @@ mod recycle_tests {
         std::fs::write(dir.join("project.json"), b"{}").unwrap();
         super::move_to_recycle_bin(&dir).unwrap();
         assert!(!dir.exists());
+    }
+}
+
+/// The key each track actually responds to: custom keys first, then the defaults
+/// Q/W/E/R (normal/whistle/finish/clap) go to the track whose sample is that kind,
+/// and any left over go to the first four tracks in order.
+pub fn effective_keys(tracks: &[Track]) -> Vec<Option<String>> {
+    // Match the hitsound part of the name ("hitclap"), not the sample set ("normal-..."),
+    // so normal-hitclap.wav counts as a clap.
+    const DEFAULTS: [(&str, &str); 4] = [("hitnormal", "Q"), ("hitwhistle", "W"), ("hitfinish", "E"), ("hitclap", "R")];
+    let mut out: Vec<Option<String>> = tracks.iter().map(|t| t.key.clone().filter(|k| !k.is_empty())).collect();
+    let taken = |out: &Vec<Option<String>>, key: &str| out.iter().any(|k| k.as_deref() == Some(key));
+    let free = |out: &Vec<Option<String>>, i: usize| tracks[i].key.is_none() && out[i].is_none();
+    let mut pending = Vec::new();
+    for (idx, (kind, key)) in DEFAULTS.iter().enumerate() {
+        if taken(&out, key) {
+            continue;
+        }
+        let by_sample = (0..tracks.len()).find(|&i| free(&out, i) && tracks[i].sample.as_ref().is_some_and(|s| s.file.to_ascii_lowercase().contains(kind)));
+        match by_sample {
+            Some(i) => out[i] = Some(key.to_string()),
+            None => pending.push((idx, key)),
+        }
+    }
+    for (idx, key) in pending {
+        if !taken(&out, key) && idx < tracks.len() && free(&out, idx) {
+            out[idx] = Some(key.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    fn track(id: u64, file: &str, key: Option<&str>) -> Track {
+        Track {
+            id,
+            name: format!("t{id}"),
+            sample: Some(SampleRef { source: SampleSource::Mapset, file: file.into() }),
+            volume: 80,
+            muted: false,
+            solo: false,
+            color: 0,
+            notes: vec![],
+            key: key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn defaults_follow_sample_kind_then_order() {
+        let t = vec![track(1, "kick.wav", None), track(2, "soft-hitclap.wav", None), track(3, "drum-hitwhistle.ogg", None)];
+        let k = effective_keys(&t);
+        // whistle and clap match by sample; Q falls back to the first track, E has no free track left in order.
+        assert_eq!(k, vec![Some("Q".into()), Some("R".into()), Some("W".into())]);
+    }
+
+    #[test]
+    fn custom_keys_win_and_free_their_default() {
+        let t = vec![track(1, "normal-hitnormal.wav", Some("A")), track(2, "x.wav", Some("")), track(3, "y.wav", None)];
+        let k = effective_keys(&t);
+        assert_eq!(k[0].as_deref(), Some("A"));
+        assert_eq!(k[1], None, "explicitly no key");
+        // Q is unused by anyone, but track 0 (Q's fallback) has a custom key, so Q stays free; track 3 gets E by order.
+        assert_eq!(k[2].as_deref(), Some("E"));
+    }
+
+    #[test]
+    fn a_custom_key_can_take_a_default_letter() {
+        let t = vec![track(1, "normal-hitnormal.wav", None), track(2, "z.wav", Some("Q"))];
+        let k = effective_keys(&t);
+        assert_eq!(k[1].as_deref(), Some("Q"));
+        assert_ne!(k[0].as_deref(), Some("Q"));
+    }
+}
+
+#[cfg(test)]
+mod key_match_tests {
+    use super::*;
+
+    #[test]
+    fn sample_set_prefix_is_not_the_hitsound() {
+        let mk = |id, f: &str| Track { id, name: String::new(), sample: Some(SampleRef { source: SampleSource::Mapset, file: f.into() }), volume: 80, muted: false, solo: false, color: 0, notes: vec![], key: None };
+        let k = effective_keys(&[mk(1, "normal-hitclap.wav"), mk(2, "normal-hitnormal.wav")]);
+        assert_eq!(k[0].as_deref(), Some("R"));
+        assert_eq!(k[1].as_deref(), Some("Q"));
     }
 }

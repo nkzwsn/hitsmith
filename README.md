@@ -1,4 +1,4 @@
-<img src="assets/logo.svg" width="96" alt="hitsmith logo: an eighth note with a hammer for a flag">
+<img src="assets/logo.svg" width="96" alt="hitsmith logo: a drum with an anvil on the drumhead">
 
 # hitsmith
 
@@ -25,7 +25,7 @@ Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the
 | Alt+wheel | Zoom |
 | Ctrl+Up / Down | Playback speed (25% steps, Shift: 5%) |
 | 1 / 2 | Select tool / Place tool |
-| Q / W / E / R | Toggle normal / whistle / finish / clap hit at the playhead |
+| Track keys (default Q / W / E / R) | Toggle a hit at the playhead on that track; click a track's key cap to change it |
 | Ctrl+A / X / C / V / D, Delete, J / K | Select all, cut, copy, paste, clone, delete, nudge |
 | Ctrl+B, Ctrl+Shift+B, Ctrl+Left / Right | Add, remove, jump between bookmarks |
 | Ctrl+Shift+P, Ctrl+I | Add / delete a volume point |

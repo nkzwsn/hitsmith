@@ -19,13 +19,42 @@ use crate::project::{Project, SampleEntry};
 pub const MANIFEST: &str = ".hitsmith-export.json";
 const RATE: u32 = 44_100;
 
+/// What this app created in a mapset folder, grouped per exported difficulty
+/// (.osu file name), so one export never overwrites or deletes another's files.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Manifest {
+    #[serde(default)]
+    pub exports: BTreeMap<String, Vec<String>>,
+    /// Older single-list format; migrated into `exports` when read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
 }
 
+impl Manifest {
+    /// Every file any export created (hidden from the sample list).
+    pub fn all_files(&self) -> Vec<String> {
+        self.exports.values().flatten().cloned().collect()
+    }
+    fn key_for(&self, osu_name: &str) -> Option<String> {
+        self.exports.keys().find(|k| k.eq_ignore_ascii_case(osu_name)).cloned()
+    }
+}
+
 pub fn read_manifest(mapset_dir: &Path) -> Manifest {
-    fs::read(mapset_dir.join(MANIFEST)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let mut m: Manifest = fs::read(mapset_dir.join(MANIFEST)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    if !m.files.is_empty() {
+        let files = std::mem::take(&mut m.files);
+        let key = files.iter().find(|f| f.to_ascii_lowercase().ends_with(".osu")).cloned().unwrap_or_default();
+        m.exports.entry(key).or_default().extend(files);
+    }
+    m
+}
+
+fn write_manifest(mapset_dir: &Path, m: &Manifest) -> Result<()> {
+    let tmp = mapset_dir.join(format!("{MANIFEST}.tmp"));
+    fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
+    fs::rename(&tmp, mapset_dir.join(MANIFEST))?;
+    Ok(())
 }
 
 pub struct Report {
@@ -123,9 +152,15 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
         circles.push((t, id));
     }
 
-    // 3. Pick sample indices that don't clobber the mapset's own files.
-    let manifest = read_manifest(dir);
-    let owned = |name: &str| manifest.files.iter().any(|f| f.eq_ignore_ascii_case(name));
+    // 3. The difficulty's file name, and the files a previous export of it created.
+    let m = &source.meta;
+    let osu_name = format!("{} - {} ({}) [{}].osu", osu::sanitize_file_part(&m.artist), osu::sanitize_file_part(&m.title), osu::sanitize_file_part(&m.creator), diff_name);
+    let mut manifest = read_manifest(dir);
+    let key = manifest.key_for(&osu_name).unwrap_or_else(|| osu_name.clone());
+    let previous: Vec<String> = manifest.exports.get(&key).cloned().unwrap_or_default();
+    // Only files from this difficulty's own last export may be replaced; everything else
+    // (the mapset's samples, other difficulties' exports) is left alone.
+    let owned = |name: &str| previous.iter().any(|f| f.eq_ignore_ascii_case(name));
     let occupied = |index: u32| {
         ["wav", "ogg", "mp3"].iter().any(|ext| {
             let name = hitnormal_name(index, ext);
@@ -143,8 +178,6 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
     }
 
     // 4. Target .osu must be new or ours.
-    let m = &source.meta;
-    let osu_name = format!("{} - {} ({}) [{}].osu", osu::sanitize_file_part(&m.artist), osu::sanitize_file_part(&m.title), osu::sanitize_file_part(&m.creator), diff_name);
     if osu_name.eq_ignore_ascii_case(&project.osu_file) {
         bail!("That name would overwrite the source difficulty. Pick another name.");
     }
@@ -162,6 +195,20 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
             }
         }
     }
+    // Record what we are about to create before writing it, so a failed export
+    // still leaves files that the next export recognises as ours and cleans up.
+    let mut planned: Vec<String> = indices.iter().map(|&i| hitnormal_name(i, "wav")).collect();
+    planned.push(osu_name.clone());
+    {
+        let entry = manifest.exports.entry(key.clone()).or_default();
+        for f in &planned {
+            if !entry.iter().any(|e| e.eq_ignore_ascii_case(f)) {
+                entry.push(f.clone());
+            }
+        }
+    }
+    write_manifest(dir, &manifest)?;
+
     let mut written: Vec<String> = Vec::new();
     let mut clipped = 0;
     for (combo, &index) in combos.iter().zip(&indices) {
@@ -222,28 +269,39 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
     // 7. Write the difficulty from the source as a template.
     let mut text = osu::set_value(&source.text, "Metadata", "Version", diff_name);
     text = osu::set_value(&text, "Metadata", "BeatmapID", "0");
-    if !project.bookmarks.is_empty() {
+    // The project's bookmarks replace the source's (an empty list clears them).
+    if project.bookmarks.is_empty() {
+        text = osu::remove_value(&text, "Editor", "Bookmarks");
+    } else {
         let marks: Vec<String> = project.bookmarks.iter().map(|b| b.to_string()).collect();
+        text = osu::ensure_section(&text, "Editor", "Metadata");
         text = osu::set_value(&text, "Editor", "Bookmarks", &marks.join(","));
     }
     text = osu::replace_section(&text, "TimingPoints", &timing.join("\r\n"));
     text = osu::replace_section(&text, "HitObjects", &objects.join("\r\n"));
     let osu_tmp = dir.join(format!("{osu_name}.tmp"));
-    fs::write(&osu_tmp, text.as_bytes())?;
-    fs::rename(&osu_tmp, dir.join(&osu_name))?;
+    let wrote = fs::write(&osu_tmp, text.as_bytes()).and_then(|_| fs::rename(&osu_tmp, dir.join(&osu_name)));
+    if let Err(e) = wrote {
+        let _ = fs::remove_file(&osu_tmp);
+        return Err(anyhow::Error::new(e).context(format!("writing {osu_name} (is it open in osu!?)")));
+    }
     written.push(osu_name.clone());
 
-    // 8. Remove files from a previous export that are no longer needed, then record ownership.
-    for old in &manifest.files {
-        if !written.iter().any(|w| w.eq_ignore_ascii_case(old)) {
+    // 8. Remove this difficulty's leftovers from its previous export (never files another
+    //    export still uses), then record exactly what this export owns.
+    let others: Vec<String> = manifest.exports.iter().filter(|(k, _)| **k != key).flat_map(|(_, v)| v.clone()).collect();
+    for old in &previous {
+        let still_mine = written.iter().any(|w| w.eq_ignore_ascii_case(old));
+        let used_elsewhere = others.iter().any(|o| o.eq_ignore_ascii_case(old));
+        if !still_mine && !used_elsewhere {
             let p = dir.join(old);
             if p.parent() == Some(dir.as_path()) {
                 let _ = fs::remove_file(p);
             }
         }
     }
-    let man = Manifest { files: written };
-    fs::write(dir.join(MANIFEST), serde_json::to_vec_pretty(&man)?)?;
+    manifest.exports.insert(key, written);
+    write_manifest(dir, &manifest)?;
 
     Ok(Report {
         osu_file: osu_name,
@@ -280,8 +338,8 @@ mod tests {
         let mut p = Project::new(dir.clone(), "Art - Song (me) [Hard].osu".into());
         p.content.control_points = vec![ControlPoint { time: 0, volume: 60 }, ControlPoint { time: 2000, volume: 30 }];
         p.content.tracks = vec![
-            Track { id: 1, name: "clap".into(), sample: Some(lib[0].r.clone()), volume: 100, muted: false, solo: false, color: 0, notes: vec![1000, 1500, 2500] },
-            Track { id: 2, name: "kick".into(), sample: Some(lib[1].r.clone()), volume: 50, muted: false, solo: false, color: 1, notes: vec![1000, 3200] },
+            Track { id: 1, name: "clap".into(), sample: Some(lib[0].r.clone()), volume: 100, muted: false, solo: false, color: 0, notes: vec![1000, 1500, 2500], key: None },
+            Track { id: 2, name: "kick".into(), sample: Some(lib[1].r.clone()), volume: 50, muted: false, solo: false, color: 1, notes: vec![1000, 3200], key: None },
         ];
         let r = export(&p, &lib).unwrap();
         assert_eq!(r.circles, 4);
@@ -309,6 +367,35 @@ mod tests {
         // Refuses to overwrite a difficulty it didn't make.
         p.export.diff_name = "Hard".into();
         assert!(export(&p, &lib).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn separate_difficulties_keep_their_own_files() {
+        let dir = std::env::temp_dir().join(format!("hitsmith-export2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = "osu file format v14\r\n\r\n[General]\r\nAudioFilename: a.mp3\r\n\r\n[Metadata]\r\nTitle:S\r\nArtist:A\r\nCreator:c\r\nVersion:Hard\r\n\r\n[TimingPoints]\r\n0,500,4,2,0,60,1,0\r\n\r\n[HitObjects]\r\n";
+        fs::write(dir.join("A - S (c) [Hard].osu"), src).unwrap();
+        let clap = dir.join("clap.wav");
+        audio::write_wav(&clap, &Pcm { rate: 44_100, data: vec![0.2; 400] }).unwrap();
+        let lib = vec![SampleEntry { r: SampleRef { source: SampleSource::Mapset, file: "clap.wav".into() }, path: clap }];
+        let mut p = Project::new(dir.clone(), "A - S (c) [Hard].osu".into());
+        p.content.tracks = vec![Track { id: 1, name: "c".into(), sample: Some(lib[0].r.clone()), volume: 100, muted: false, solo: false, color: 0, notes: vec![0, 500], key: None }];
+        p.export.diff_name = "One".into();
+        let a = export(&p, &lib).unwrap();
+        p.export.diff_name = "Two".into();
+        let b = export(&p, &lib).unwrap();
+        assert!(dir.join(&a.osu_file).exists(), "first difficulty must survive the second export");
+        assert!(dir.join(&b.osu_file).exists());
+        assert_ne!(a.first_index, b.first_index, "the second export must not reuse the first one's sample");
+        // Re-exporting "One" keeps its own index and doesn't delete "Two".
+        p.export.diff_name = "One".into();
+        let a2 = export(&p, &lib).unwrap();
+        assert_eq!(a2.first_index, a.first_index);
+        assert!(dir.join(&b.osu_file).exists());
+        // Bookmarks: none in the project means none in the export.
+        assert!(!fs::read_to_string(dir.join(&a2.osu_file)).unwrap().contains("Bookmarks"));
         fs::remove_dir_all(&dir).ok();
     }
 }

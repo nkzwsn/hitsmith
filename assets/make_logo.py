@@ -1,8 +1,11 @@
-"""Generates the hitsmith logo: an eighth note whose stem is a hammer handle.
+"""hitsmith logo: line-work anvil standing on a drum.
 
-Outputs logo.svg, icon-256.png and icon.ico (16-256 px) next to this script.
-Pure Python (no Pillow): shapes are rasterized with supersampling.
-Run: python make_logo.py
+One source of truth for every copy of the logo. Running this script writes:
+  - src/logo_paths.rs   smooth polylines the app strokes with the current palette
+  - assets/logo.svg     vector version (README)
+  - assets/icon-256.png and assets/icon.ico  (16-256 px, exe/window icon)
+
+Pure Python, no dependencies:  python -I assets/make_logo.py
 """
 import math
 import os
@@ -10,104 +13,193 @@ import struct
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 
-BG_TOP = (0x3a, 0x26, 0x33)
-BG_BOTTOM = (0x1a, 0x12, 0x18)
-INK = (0xfa, 0xf2, 0xf6)
-FACE = (0xff, 0x66, 0xaa)
-SPARK = (0xff, 0xcc, 0x22)
+# Static icon colours = the default "Midnight" palette (src/theme.rs).
+TILE = (0x1E, 0x21, 0x29)
+ACCENT = (0x6E, 0x8C, 0xFF)  # drum
+TEXT = (0xE6, 0xE8, 0xEE)    # anvil
+STROKE = 13.0                # line width on the 256 grid
 
-# Geometry on a 256x256 canvas.
-HEAD = dict(cx=88, cy=184, rx=42, ry=31, rot=-24)  # note head (tilted ellipse)
-STEM = (110, 64, 130, 180)                          # handle: x0, y0, x1, y1
-GRIPS = []                                          # (unused) bands cut into the handle
-HAMMER = (62, 40, 180, 86, 9)                       # hammer head: x0, y0, x1, y1, radius
-PEEN = []                                           # (unused) tapered back end
-FACE_CAP = (176, 32, 202, 94, 7)                    # striking face, pink
-SPARKS = [((214, 42), (230, 30)), ((218, 63), (236, 63)), ((214, 84), (230, 96))]
+# ------------------------------------------------------------------ geometry
 
 
-def in_round_rect(x, y, r):
-    x0, y0, x1, y1, rad = r
-    if x < x0 or x > x1 or y < y0 or y > y1:
-        return False
-    cx = min(max(x, x0 + rad), x1 - rad)
-    cy = min(max(y, y0 + rad), y1 - rad)
-    return (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad
+def quad(p0, p1, p2, n):
+    """Points of a quadratic Bezier from p0 to p2 with control p1 (excluding p0)."""
+    out = []
+    for i in range(1, n + 1):
+        t = i / n
+        a, b, c = (1 - t) ** 2, 2 * (1 - t) * t, t * t
+        out.append((a * p0[0] + b * p1[0] + c * p2[0], a * p0[1] + b * p1[1] + c * p2[1]))
+    return out
 
 
-def in_rect(x, y, r):
-    x0, y0, x1, y1 = r
-    return x0 <= x <= x1 and y0 <= y <= y1
+def rounded(points, r):
+    """Closed polyline through `points` with every corner replaced by a smooth fillet."""
+    n = len(points)
+    out = []
+    for i in range(n):
+        prev, cur, nxt = points[i - 1], points[i], points[(i + 1) % n]
+        d1, d2 = math.dist(prev, cur), math.dist(cur, nxt)
+        k = min(r, d1 / 2, d2 / 2)
+        a = (cur[0] + (prev[0] - cur[0]) * k / d1, cur[1] + (prev[1] - cur[1]) * k / d1)
+        b = (cur[0] + (nxt[0] - cur[0]) * k / d2, cur[1] + (nxt[1] - cur[1]) * k / d2)
+        out.append(a)
+        out.extend(quad(a, cur, b, 8))
+    return out
 
 
-def in_ellipse(x, y, e):
-    a = math.radians(e["rot"])
-    dx, dy = x - e["cx"], y - e["cy"]
-    u = dx * math.cos(a) + dy * math.sin(a)
-    v = -dx * math.sin(a) + dy * math.cos(a)
-    return (u / e["rx"]) ** 2 + (v / e["ry"]) ** 2 <= 1.0
+CX, RX, RY = 128.0, 80.0, 24.0
+HEAD_Y, FOOT_Y = 152.0, 198.0
+
+# Drum: the full top ellipse (drumhead) ...
+drum_head = [(CX + RX * math.cos(math.tau * i / 72), HEAD_Y + RY * math.sin(math.tau * i / 72)) for i in range(72)]
+# ... and one stroke for the shell: left side down, the front of the bottom rim, right side up.
+rim = [(CX + RX * math.cos(math.pi - math.pi * i / 48), FOOT_Y + RY * math.sin(math.pi - math.pi * i / 48)) for i in range(49)]
+drum_body = [(CX - RX, HEAD_Y)] + rim + [(CX + RX, HEAD_Y)]
+
+# Anvil in side profile, horn to the left, foot standing on the drumhead.
+FOOT = HEAD_Y - 4.0
+anvil = rounded([
+    (100.0, FOOT),    # foot, bottom left
+    (112.0, 130.0),   # foot flares in
+    (124.0, 122.0),   # waist left
+    (124.0, 106.0),   # under the face, left
+    (96.0, 101.0),    # underside of the horn
+    (48.0, 86.0),     # horn tip
+    (104.0, 78.0),    # top of the horn meets the face
+    (192.0, 78.0),    # face, top right
+    (192.0, 106.0),   # face, bottom right
+    (160.0, 106.0),   # under the face, right
+    (160.0, 122.0),   # waist right
+    (172.0, 130.0),   # foot flares out
+    (180.0, FOOT),    # foot, bottom right
+], 9.0)
+
+# Convex pieces covering the anvil's inside. They are filled with the background
+# first, so the drumhead behind the anvil is hidden and the anvil sits in front.
+MASKS = [
+    [(96.0, 101.0), (48.0, 86.0), (104.0, 78.0), (192.0, 78.0), (192.0, 106.0), (124.0, 106.0)],
+    [(124.0, 104.0), (160.0, 104.0), (160.0, 124.0), (124.0, 124.0)],
+    [(100.0, FOOT), (112.0, 130.0), (124.0, 122.0), (160.0, 122.0), (172.0, 130.0), (180.0, FOOT)],
+]
+
+PATHS = [
+    # (role, closed, points). Role 0 = drum (accent), 1 = anvil (text).
+    (0, True, drum_head),
+    (0, False, drum_body),
+    (1, True, anvil),
+]
+
+# ------------------------------------------------------------------ outputs
 
 
-def in_poly(x, y, pts):
-    inside = False
-    j = len(pts) - 1
-    for i in range(len(pts)):
-        xi, yi = pts[i]
-        xj, yj = pts[j]
-        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
-            inside = not inside
-        j = i
-    return inside
+def write_rust():
+    lines = [
+        "//! Generated by assets/make_logo.py. Do not edit by hand.",
+        "",
+        "/// Line width on the 256x256 design grid.",
+        f"pub const STROKE: f32 = {STROKE:.1f};",
+        "",
+        "/// (role, closed, points). Role 0 = drum (accent colour), 1 = anvil (text colour).",
+        "pub const PATHS: &[(u8, bool, &[(f32, f32)])] = &[",
+    ]
+    for role, closed, pts in PATHS:
+        body = ", ".join(f"({x:.1f}, {y:.1f})" for x, y in pts)
+        lines.append(f"    ({role}, {'true' if closed else 'false'}, &[{body}]),")
+    lines.append("];")
+    lines.append("")
+    lines.append("/// Convex pieces of the anvil's inside, filled with the background before stroking.")
+    lines.append("pub const MASKS: &[&[(f32, f32)]] = &[")
+    for m in MASKS:
+        lines.append("    &[" + ", ".join(f"({x:.1f}, {y:.1f})" for x, y in m) + "],")
+    lines.append("];")
+    with open(os.path.join(ROOT, "src", "logo_paths.rs"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
-def near_segment(x, y, seg, width):
-    (x0, y0), (x1, y1) = seg
+def hexc(c):
+    return "#%02x%02x%02x" % c
+
+
+def write_svg():
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="hitsmith">',
+             f'  <rect width="256" height="256" rx="56" fill="{hexc(TILE)}"/>',
+             f'  <g fill="none" stroke-width="{STROKE}" stroke-linecap="round" stroke-linejoin="round">']
+    # The anvil is drawn last with a background fill, so it hides the drumhead behind it.
+    for role, closed, pts in PATHS:
+        tag = "polygon" if closed else "polyline"
+        d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+        fill = f' fill="{hexc(TILE)}"' if role == 1 else ""
+        parts.append(f'    <{tag} points="{d}" stroke="{hexc(ACCENT if role == 0 else TEXT)}"{fill}/>')
+    parts += ["  </g>", "</svg>", ""]
+    with open(os.path.join(HERE, "logo.svg"), "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+
+def seg_dist2(px, py, a, b):
+    (x0, y0), (x1, y1) = a, b
     dx, dy = x1 - x0, y1 - y0
-    t = max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy)))
-    px, py = x0 + t * dx, y0 + t * dy
-    return (x - px) ** 2 + (y - py) ** 2 <= (width / 2) ** 2
+    l2 = dx * dx + dy * dy
+    t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / l2))
+    qx, qy = x0 + t * dx - px, y0 + t * dy - py
+    return qx * qx + qy * qy
 
 
-def sample(x, y, sparks):
-    """Colour (r, g, b, a) of the logo at canvas point (x, y)."""
-    if not in_round_rect(x, y, (0, 0, 256, 256, 56)):
-        return (0, 0, 0, 0)
-    t = y / 256
-    col = tuple(round(BG_TOP[i] * (1 - t) + BG_BOTTOM[i] * t) for i in range(3))
-    if sparks and any(near_segment(x, y, s, 8) for s in SPARKS):
-        col = SPARK
-    ink = (in_ellipse(x, y, HEAD) or (in_rect(x, y, STEM) and not any(in_rect(x, y, g) for g in GRIPS))
-           or in_round_rect(x, y, HAMMER) or (PEEN and in_poly(x, y, PEEN)))
-    if ink:
-        col = INK
-    if in_round_rect(x, y, FACE_CAP):
-        col = FACE
-    return col + (255,)
+def inside(x, y, poly):
+    # Convex polygon test: same side of every edge.
+    sign = 0
+    for (x0, y0), (x1, y1) in zip(poly, poly[1:] + poly[:1]):
+        c = (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0)
+        if c != 0:
+            if sign == 0:
+                sign = 1 if c > 0 else -1
+            elif (c > 0) != (sign > 0):
+                return False
+    return True
 
 
-def render(size, ss=4):
-    # Small icons drop the sparks so the silhouette stays crisp.
-    sparks = size >= 48
+def render(size):
+    """Distance-to-segment rasterizer: gives round caps and joins for free."""
+    half = max(STROKE, 1.3 * 256 / size) / 2  # keep lines visible at tiny sizes
+    cell = 16
+    grid = {}
+    for role, closed, pts in PATHS:
+        color = ACCENT if role == 0 else TEXT
+        seq = pts + ([pts[0]] if closed else [])
+        for a, b in zip(seq, seq[1:]):
+            for gx in range(int((min(a[0], b[0]) - half) // cell), int((max(a[0], b[0]) + half) // cell) + 1):
+                for gy in range(int((min(a[1], b[1]) - half) // cell), int((max(a[1], b[1]) + half) // cell) + 1):
+                    grid.setdefault((gx, gy), []).append((a, b, color))
+    ss = 4 if size >= 64 else 6
     scale = 256 / size
     rows = []
     for py in range(size):
         row = bytearray()
         for px in range(size):
-            acc = [0, 0, 0, 0]
+            acc = [0.0, 0.0, 0.0, 0]
             for sy in range(ss):
                 for sx in range(ss):
-                    r, g, b, a = sample((px + (sx + 0.5) / ss) * scale, (py + (sy + 0.5) / ss) * scale, sparks)
-                    acc[0] += r * a
-                    acc[1] += g * a
-                    acc[2] += b * a
-                    acc[3] += a
-            n = ss * ss
-            a = acc[3] / n
-            if a == 0:
+                    x = (px + (sx + 0.5) / ss) * scale
+                    y = (py + (sy + 0.5) / ss) * scale
+                    cx, cy = min(max(x, 56), 200), min(max(y, 56), 200)
+                    if (x - cx) ** 2 + (y - cy) ** 2 > 56 * 56:
+                        continue  # outside the rounded tile
+                    col = TILE
+                    masked = any(inside(x, y, m) for m in MASKS)
+                    for a, b, c in grid.get((int(x // cell), int(y // cell)), ()):
+                        if seg_dist2(x, y, a, b) <= half * half and (c == TEXT or not masked):
+                            col = c
+                            if c == TEXT:
+                                break  # the anvil sits in front of the drum
+                    acc[0] += col[0]
+                    acc[1] += col[1]
+                    acc[2] += col[2]
+                    acc[3] += 1
+            if acc[3] == 0:
                 row += b"\0\0\0\0"
             else:
-                row += bytes((round(acc[0] / acc[3]), round(acc[1] / acc[3]), round(acc[2] / acc[3]), round(a)))
+                row += bytes((round(acc[0] / acc[3]), round(acc[1] / acc[3]), round(acc[2] / acc[3]), round(255 * acc[3] / (ss * ss))))
         rows.append(bytes(row))
     return rows
 
@@ -122,60 +214,23 @@ def png_bytes(rows, size):
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
-def svg():
-    e = HEAD
-    grips = "".join(f'<rect x="{g[0]}" y="{g[1]}" width="{g[2]-g[0]}" height="{g[3]-g[1]}" fill="url(#bg)"/>' for g in GRIPS)
-    sparks = "".join(f'<line x1="{a[0]}" y1="{a[1]}" x2="{b[0]}" y2="{b[1]}"/>' for a, b in SPARKS)
-    hx0, hy0, hx1, hy1, hr = HAMMER
-    fx0, fy0, fx1, fy1, fr = FACE_CAP
-    sx0, sy0, sx1, sy1 = STEM
-    peen = " ".join(f"{x},{y}" for x, y in PEEN)
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="hitsmith">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#{BG_TOP[0]:02x}{BG_TOP[1]:02x}{BG_TOP[2]:02x}"/>
-      <stop offset="1" stop-color="#{BG_BOTTOM[0]:02x}{BG_BOTTOM[1]:02x}{BG_BOTTOM[2]:02x}"/>
-    </linearGradient>
-    <clipPath id="tile"><rect width="256" height="256" rx="56"/></clipPath>
-  </defs>
-  <g clip-path="url(#tile)">
-    <rect width="256" height="256" fill="url(#bg)"/>
-    <g stroke="#{SPARK[0]:02x}{SPARK[1]:02x}{SPARK[2]:02x}" stroke-width="8" stroke-linecap="round">{sparks}</g>
-    <g fill="#{INK[0]:02x}{INK[1]:02x}{INK[2]:02x}">
-      <ellipse cx="{e["cx"]}" cy="{e["cy"]}" rx="{e["rx"]}" ry="{e["ry"]}" transform="rotate({e["rot"]} {e["cx"]} {e["cy"]})"/>
-      <rect x="{sx0}" y="{sy0}" width="{sx1-sx0}" height="{sy1-sy0}"/>
-      <rect x="{hx0}" y="{hy0}" width="{hx1-hx0}" height="{hy1-hy0}" rx="{hr}"/>
-      {f'<polygon points="{peen}"/>' if PEEN else ''}
-    </g>
-    {grips}
-    <rect x="{fx0}" y="{fy0}" width="{fx1-fx0}" height="{fy1-fy0}" rx="{fr}" fill="#{FACE[0]:02x}{FACE[1]:02x}{FACE[2]:02x}"/>
-  </g>
-</svg>
-'''
-
-
 def main():
-    with open(os.path.join(HERE, "logo.svg"), "w", encoding="utf-8") as f:
-        f.write(svg())
+    write_rust()
+    write_svg()
     sizes = [16, 24, 32, 48, 64, 128, 256]
-    images = {}
-    for s in sizes:
-        images[s] = png_bytes(render(s, ss=4 if s >= 64 else 8), s)
-        print("rendered", s)
+    images = {s: png_bytes(render(s), s) for s in sizes}
     with open(os.path.join(HERE, "icon-256.png"), "wb") as f:
         f.write(images[256])
-    # ICO with PNG-compressed entries (supported since Windows Vista).
     header = struct.pack("<HHH", 0, 1, len(sizes))
     offset = 6 + 16 * len(sizes)
-    entries = b""
-    blobs = b""
+    entries, blobs = b"", b""
     for s in sizes:
         data = images[s]
         entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset + len(blobs))
         blobs += data
     with open(os.path.join(HERE, "icon.ico"), "wb") as f:
         f.write(header + entries + blobs)
-    print("wrote logo.svg, icon-256.png, icon.ico")
+    print("wrote src/logo_paths.rs, assets/logo.svg, assets/icon-256.png, assets/icon.ico")
 
 
 if __name__ == "__main__":

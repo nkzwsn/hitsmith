@@ -175,7 +175,7 @@ pub struct App {
     theme: ThemeState,
     pal: Palette,
     theme_changed: bool,
-    logo: Option<egui::TextureHandle>,
+    titlebar: crate::titlebar::TitleBar,
 }
 
 fn data_dir() -> PathBuf {
@@ -246,7 +246,7 @@ impl App {
         };
         let theme = ThemeState::new(settings.palette());
         let pal = *theme.target();
-        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, logo: load_logo(&cc.egui_ctx) };
+        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, titlebar: Default::default() };
         app.refresh_projects();
         app
     }
@@ -331,9 +331,8 @@ impl App {
 
         egui::Panel::top("home-top").frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(18, 10))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if let Some(logo) = &self.logo {
-                    ui.image((logo.id(), vec2(30.0, 30.0)));
-                }
+                let (logo_rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                icons::paint_logo(ui.painter(), logo_rect, &pal, pal.bg);
                 ui.label(egui::RichText::new("hitsmith").size(20.0).strong());
                 ui.label(egui::RichText::new("hitsounding workstation for osu!").color(pal.text_weak));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -607,12 +606,6 @@ fn project_card(ui: &mut egui::Ui, pal: &Palette, p: &ProjectEntry, thumb: Optio
     CardAction::None
 }
 
-fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let img = image::load_from_memory(crate::LOGO_PNG).ok()?.thumbnail(64, 64).to_rgba8();
-    let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-    Some(ctx.load_texture("logo", color, egui::TextureOptions::LINEAR))
-}
-
 fn load_background(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
     if !path.is_file() {
         return None;
@@ -636,7 +629,7 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::T)) {
             self.settings.dark_mode = !self.settings.dark_mode;
@@ -647,6 +640,8 @@ impl eframe::App for App {
             self.save_settings();
         }
         self.pal = self.theme.apply(&ctx);
+        // The native title bar blends along with the rest of the theme.
+        self.titlebar.apply(frame, &self.pal);
         let mut go_home = false;
         match &mut self.screen {
             Screen::Home => self.home_ui(ui),
@@ -671,9 +666,31 @@ impl eframe::App for App {
                 }
             }
         }
+        // Closing the window while a project is open: save first, and if that fails, ask.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Screen::Work(w) = &mut self.screen {
+                if !w.force_leave {
+                    w.save_now();
+                    if w.save_error.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        w.leave_prompt = true;
+                        w.close_after_leave = true;
+                    }
+                }
+            }
+        }
         if go_home {
             if let Screen::Work(w) = &mut self.screen {
-                w.save_now();
+                if !w.force_leave {
+                    w.save_now();
+                    if w.save_error.is_some() {
+                        w.leave_prompt = true;
+                        return;
+                    }
+                }
+                if w.close_after_leave {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             if let Some(e) = &self.engine {
                 e.stop_all();
@@ -728,7 +745,7 @@ struct Work {
     song: Option<LoadedSong>,
     song_rx: Option<mpsc::Receiver<Result<LoadedSong, String>>>,
     song_error: Option<String>,
-    library: Vec<SampleEntry>,
+    library: Arc<Vec<SampleEntry>>,
     loaded: HashMap<PathBuf, u32>,
     sample_bufs: Vec<Arc<Vec<f32>>>,
     sample_errors: HashMap<PathBuf, String>,
@@ -740,7 +757,8 @@ struct Work {
     drag: Option<Drag>,
     export_open: bool,
     export_result: Option<Result<String, String>>,
-    confirm_remove: Option<usize>,
+    /// Track id waiting for "Remove track?" confirmation.
+    confirm_remove: Option<u64>,
     save_error: Option<String>,
     follow: bool,
     skin_dir: Option<PathBuf>,
@@ -757,6 +775,14 @@ struct Work {
     row_rects: Vec<(usize, Rect)>,
     show_keys: bool,
     confirm_clear: bool,
+    /// Track id whose hit key is being reassigned (waiting for a key press).
+    capturing_key: Option<u64>,
+    /// Saving failed while leaving: ask whether to retry, leave anyway or stay.
+    leave_prompt: bool,
+    /// The user chose to leave without saving.
+    force_leave: bool,
+    /// The leave was triggered by closing the window.
+    close_after_leave: bool,
     toast: Option<(String, Instant)>,
     renaming: Option<(u64, String)>,
     pos_now: f64,
@@ -791,7 +817,7 @@ impl Work {
             song: None,
             song_rx: Some(rx),
             song_error: None,
-            library: Vec::new(),
+            library: Arc::new(Vec::new()),
             loaded: HashMap::new(),
             sample_bufs: Vec::new(),
             sample_errors: HashMap::new(),
@@ -817,6 +843,10 @@ impl Work {
             row_rects: Vec::new(),
             show_keys: false,
             confirm_clear: false,
+            capturing_key: None,
+            leave_prompt: false,
+            force_leave: false,
+            close_after_leave: false,
             toast: None,
             renaming: None,
             pos_now: 0.0,
@@ -834,8 +864,8 @@ impl Work {
     }
 
     fn refresh_library(&mut self) {
-        let exported = export::read_manifest(&self.project.mapset_dir).files;
-        self.library = project::sample_library(&self.entry.samples_dir(), &self.project.mapset_dir, &self.meta.audio_filename, self.skin_dir.as_deref(), &exported);
+        let exported = export::read_manifest(&self.project.mapset_dir).all_files();
+        self.library = Arc::new(project::sample_library(&self.entry.samples_dir(), &self.project.mapset_dir, &self.meta.audio_filename, self.skin_dir.as_deref(), &exported));
     }
 
     fn sample_path(&self, r: &SampleRef) -> Option<PathBuf> {
@@ -846,6 +876,9 @@ impl Work {
     fn ensure_sample(&mut self, path: &Path, engine: Option<&Engine>) -> Option<u32> {
         if let Some(&id) = self.loaded.get(path) {
             return Some(id);
+        }
+        if self.sample_errors.contains_key(path) {
+            return None;
         }
         let engine = engine?;
         match audio::decode_file(path) {
@@ -902,15 +935,23 @@ impl Work {
     fn undo(&mut self, engine: Option<&Engine>) {
         if let Some(c) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.project.content, c));
-            self.changed(engine);
+            self.after_history_jump(engine);
         }
     }
 
     fn redo(&mut self, engine: Option<&Engine>) {
         if let Some(c) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.project.content, c));
-            self.changed(engine);
+            self.after_history_jump(engine);
         }
+    }
+
+    /// After undo/redo the hits may be different, so anything pointing at them is stale.
+    fn after_history_jump(&mut self, engine: Option<&Engine>) {
+        self.selected.clear();
+        self.drag = None;
+        self.renaming = None;
+        self.changed(engine);
     }
 
     fn save_now(&mut self) {
@@ -919,7 +960,11 @@ impl Work {
                 self.dirty = false;
                 self.save_error = None;
             }
-            Err(e) => self.save_error = Some(format!("Save failed: {e:#}")),
+            Err(e) => {
+                self.save_error = Some(format!("Save failed: {e:#}"));
+                // Try again in a couple of seconds, not every frame.
+                self.last_edit = Instant::now() + Duration::from_secs(2);
+            }
         }
     }
 
@@ -928,7 +973,14 @@ impl Work {
     }
 
     fn duration(&self) -> f64 {
-        self.song.as_ref().map(|s| s.duration_ms).unwrap_or(60_000.0)
+        match &self.song {
+            Some(s) => s.duration_ms,
+            // Song still loading or failed to decode: don't cap editing at an arbitrary length.
+            None => {
+                let last = self.project.content.tracks.iter().filter_map(|t| t.notes.last()).max().copied().unwrap_or(0);
+                (last as f64 + 60_000.0).max(600_000.0)
+            }
+        }
     }
 
     fn x_of(&self, rect: Rect, t: f64) -> f32 {
@@ -947,7 +999,7 @@ impl Work {
         // Prefer a sample no other track uses yet.
         let used: Vec<&SampleRef> = self.project.content.tracks.iter().filter_map(|t| t.sample.as_ref()).collect();
         let sample = self.library.iter().find(|e| !used.contains(&&e.r)).or(self.library.first()).map(|e| e.r.clone());
-        self.project.content.tracks.push(Track { id, name: format!("Track {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % 8) as u8, notes: Vec::new() });
+        self.project.content.tracks.push(Track { id, name: format!("Track {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % 8) as u8, notes: Vec::new(), key: None });
         self.changed(engine);
     }
 
@@ -983,7 +1035,15 @@ impl Work {
 
         // osu!-editor style keyboard shortcuts (ignored while typing in a text field).
         let typing = ctx.memory(|m| m.focused()).is_some() && ctx.egui_wants_keyboard_input();
-        if !typing && self.handle_keys(&ctx, engine, playing, pos) {
+        let modal_open = self.confirm_remove.is_some() || self.confirm_clear || self.leave_prompt;
+        if modal_open {
+            // Only Esc works behind a confirmation dialog: it cancels it.
+            if take_key(&ctx, Modifiers::NONE, Key::Escape) {
+                self.confirm_remove = None;
+                self.confirm_clear = false;
+                self.leave_prompt = false;
+            }
+        } else if !typing && self.handle_keys(&ctx, engine, playing, pos) {
             go_home = true;
         }
 
@@ -1174,7 +1234,8 @@ impl Work {
             // Raw wheel events are counted in notches so one notch = one step.
             self.view_span = grid_w as f64 / self.project.zoom as f64;
             let hover = ui.input(|i| i.pointer.hover_pos());
-            if let Some(h) = hover.filter(|h| full.contains(*h) && h.x > timeline_left) {
+            let over_popup = |h: Pos2| ctx.layer_id_at(h).is_some_and(|l| l.order != egui::Order::Background);
+            if let Some(h) = hover.filter(|h| full.contains(*h) && h.x > timeline_left && !over_popup(*h)) {
                 let notches: Vec<(f32, Modifiers)> = ui.input(|i| {
                     i.events
                         .iter()
@@ -1302,19 +1363,21 @@ impl Work {
             });
         });
 
-        if let Some(ti) = self.confirm_remove {
-            let name = self.project.content.tracks.get(ti).map(|t| t.name.clone()).unwrap_or_default();
+        if let Some(id) = self.confirm_remove {
+            let ti = self.track_index(id);
+            let name = ti.and_then(|i| self.project.content.tracks.get(i)).map(|t| t.name.clone()).unwrap_or_default();
             let mut close = false;
             egui::Modal::new(egui::Id::unique("confirm-remove")).show(&ctx, |ui| {
                 ui.heading("Remove track?");
                 ui.label(format!("\"{name}\" and all its hits will be removed. You can undo this."));
                 ui.horizontal(|ui| {
                     if ui.button("Remove").clicked() {
-                        self.checkpoint();
-                        if ti < self.project.content.tracks.len() {
+                        if let Some(ti) = self.track_index(id) {
+                            self.checkpoint();
                             self.project.content.tracks.remove(ti);
+                            self.selected.retain(|k| k.0 != id);
+                            self.changed(engine);
                         }
-                        self.changed(engine);
                         close = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1382,6 +1445,33 @@ impl Work {
             self.show_keys = open;
         }
 
+        if self.leave_prompt {
+            let err = self.save_error.clone().unwrap_or_default();
+            egui::Modal::new(egui::Id::unique("leave-prompt")).show(&ctx, |ui| {
+                ui.heading("Couldn't save the project");
+                ui.label(err);
+                ui.label("Your latest changes aren't on disk yet.");
+                ui.horizontal(|ui| {
+                    if ui.button("Try again").clicked() {
+                        self.save_now();
+                        if self.save_error.is_none() {
+                            self.leave_prompt = false;
+                            go_home = true;
+                        }
+                    }
+                    if ui.button(egui::RichText::new("Leave without saving").color(self.pal.danger)).clicked() {
+                        self.leave_prompt = false;
+                        self.force_leave = true;
+                        go_home = true;
+                    }
+                    if ui.button("Stay").clicked() {
+                        self.leave_prompt = false;
+                        self.close_after_leave = false;
+                    }
+                });
+            });
+        }
+
         if self.confirm_clear {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("confirm-clear")).show(&ctx, |ui| {
@@ -1411,6 +1501,7 @@ impl Work {
             let mut open = true;
             egui::Window::new("Export hitsound difficulty").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
                 ui.label("Writes a new difficulty plus generated samples into the mapset folder.");
+                ui.label(egui::RichText::new("Mute and solo only affect playback here; every track is exported.").size(12.0).color(self.pal.text_weak));
                 ui.label(egui::RichText::new(self.project.mapset_dir.display().to_string()).small().weak());
                 ui.add_space(6.0);
                 egui::Grid::new("export-grid").num_columns(2).show(ui, |ui| {
@@ -1458,6 +1549,11 @@ impl Work {
             });
             self.export_open = open;
         }
+        // A drag whose widget vanished (e.g. undo removed the track) never gets its
+        // "stopped" event; drop it once the mouse is released.
+        if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+        }
         go_home
     }
 
@@ -1471,13 +1567,23 @@ impl Work {
         let pos = self.pos_now;
         let playing = self.playing_now;
         let renaming = self.renaming.clone();
+        let eff_key = project::effective_keys(&self.project.content.tracks).swap_remove(ti);
+        let capturing = self.capturing_key;
+        let mut start_capture = false;
+        let mut settings_changed = false;
+        let before = {
+            let t = &self.project.content.tracks[ti];
+            (t.sample.clone(), t.volume, t.muted, t.solo)
+        };
+        let mut volume_before = before.1;
         let t = &mut self.project.content.tracks[ti];
         let color = pal.tracks[t.color as usize % 8];
 
         // Card background and colour bar that pulses when this track plays a hit.
         let card = full.shrink2(vec2(0.0, 2.0));
         ui.painter().rect_filled(card, CornerRadius::same(8), pal.panel);
-        let lit = playing && t.notes.iter().rev().find(|&&n| (n as f64) <= pos).is_some_and(|&n| pos - (n as f64) < 120.0);
+        let last_played = t.notes.partition_point(|&n| (n as f64) <= pos);
+        let lit = playing && last_played > 0 && pos - (t.notes[last_played - 1] as f64) < 120.0;
         let bar = Rect::from_min_size(card.min, vec2(if lit { 7.0 } else { 4.0 }, card.height()));
         ui.painter().rect_filled(bar, CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, if lit { color.lerp_to_gamma(Color32::WHITE, 0.35) } else { color });
 
@@ -1522,18 +1628,20 @@ impl Work {
                 if icons::button(ui, &pal, Icon::Headphones, "Solo", t.solo, true).clicked() {
                     t.solo = !t.solo;
                     edited = true;
+                    settings_changed = true;
                 }
                 if icons::button(ui, &pal, if t.muted { Icon::SpeakerOff } else { Icon::Speaker }, "Mute", t.muted, true).clicked() {
                     t.muted = !t.muted;
                     edited = true;
+                    settings_changed = true;
                 }
             });
         });
         ui.horizontal(|ui| {
             let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sample".into());
-            egui::ComboBox::from_id_salt(("sample", t.id)).width(160.0).selected_text(egui::RichText::new(label).size(12.5)).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(("sample", t.id)).width(140.0).selected_text(egui::RichText::new(label).size(12.5)).show_ui(ui, |ui| {
                 let mut last = None;
-                for e in &library {
+                for e in library.iter() {
                     if last != Some(e.r.source) {
                         ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
                         last = Some(e.r.source);
@@ -1542,15 +1650,29 @@ impl Work {
                     if ui.selectable_label(sel, &e.r.file).clicked() && !sel {
                         t.sample = Some(e.r.clone());
                         edited = true;
+                        settings_changed = true;
                         audition = Some((e.r.clone(), t.volume));
                     }
                 }
             });
-            ui.spacing_mut().slider_width = 56.0;
+            ui.spacing_mut().slider_width = 48.0;
+            let vol_id = egui::Id::unique(("vol-drag-start", t.id));
+            let vol_at_start = t.volume;
             let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Track volume");
+            if r.drag_started() {
+                ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
+            }
             ui.label(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak));
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            if r.drag_stopped() {
+                volume_before = ui.data(|d| d.get_temp::<u8>(vol_id)).unwrap_or(vol_at_start);
                 edited = true;
+                settings_changed = true;
+            } else if r.changed() && !r.dragged() {
+                edited = true;
+                settings_changed = true;
+            }
+            if key_badge(ui, &pal, eff_key.as_deref(), t.key.is_none(), capturing == Some(t.id)).clicked() {
+                start_capture = true;
             }
         });
         match commit_rename {
@@ -1570,13 +1692,31 @@ impl Work {
             Some(None) => self.renaming = None,
             None => {}
         }
+        if settings_changed {
+            // Undo snapshot = the project as it was before this change.
+            let mut snap = self.project.content.clone();
+            let tr = &mut snap.tracks[ti];
+            tr.sample = before.0;
+            tr.volume = volume_before;
+            tr.muted = before.2;
+            tr.solo = before.3;
+            self.undo.push(snap);
+            if self.undo.len() > 200 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
         if edited {
             self.dirty = true;
             self.last_edit = Instant::now();
             self.rebuild_events(engine);
         }
         if remove {
-            self.confirm_remove = Some(ti);
+            self.confirm_remove = Some(self.project.content.tracks[ti].id);
+        }
+        if start_capture {
+            let id = self.project.content.tracks[ti].id;
+            self.capturing_key = if self.capturing_key == Some(id) { None } else { Some(id) };
         }
         if let Some((s, vol)) = audition {
             if let Some(p) = self.sample_path(&s) {
@@ -1598,8 +1738,8 @@ impl Work {
             let x = self.x_of(rect, t);
             if measure {
                 painter.vline(x, rect.y_range(), Stroke::new(1.0, self.pal.grid_measure));
-                if x - last_label > 34.0 {
-                    let bar = osu::measure_number(&self.reds, t);
+                let bar = osu::measure_number(&self.reds, t);
+                if x - last_label > 34.0 && bar >= 1 {
                     painter.text(pos2(x + 4.0, rect.center().y), Align2::LEFT_CENTER, format!("{bar}"), FontId::proportional(11.0), self.pal.text_weak);
                     last_label = x;
                 }
@@ -2092,7 +2232,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         ("Left / Right", "Step one snap tick (Shift: 4 ticks)"),
         ("Up / Down", "Previous / next timing or volume point"),
         ("Mouse wheel", "Seek (Shift: 4x)"),
-        ("Ctrl+Up / Down", "Playback speed -/+ 25% (add Shift: 5%)"),
+        ("Ctrl+Up / Down", "Playback speed +/- 25% (add Shift: 5%)"),
     ]),
     ("Snap and zoom", &[
         ("Ctrl+wheel", "Change snap divisor"),
@@ -2102,7 +2242,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("Editing", &[
         ("1 / 2", "Select tool / Place tool"),
-        ("Q / W / E / R", "Toggle normal / whistle / finish / clap hit at the playhead"),
+        ("Track keys", "Toggle a hit at the playhead (default Q / W / E / R; click a track's key cap to change)"),
         ("Ctrl+A", "Select all hits"),
         ("Ctrl+X / C / V", "Cut / copy / paste at the playhead"),
         ("Ctrl+D", "Clone selection one measure later"),
@@ -2152,6 +2292,13 @@ impl Work {
         let cmd = Modifiers::COMMAND;
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let k = |m: Modifiers, key: Key| take_key(ctx, m, key);
+
+        // Waiting for a new hit key for a track: the next key press is the answer.
+        if let Some(id) = self.capturing_key {
+            if self.capture_key(ctx, id, engine) {
+                return false;
+            }
+        }
 
         // Transport.
         if k(none, Key::Space) || k(none, Key::C) {
@@ -2311,10 +2458,13 @@ impl Work {
             self.nudge_selection(1, engine);
         }
 
-        // Hitsound keys: toggle a hit at the playhead on the matching track.
-        for (key, kind, fallback) in [(Key::Q, "normal", 0usize), (Key::W, "whistle", 1), (Key::E, "finish", 2), (Key::R, "clap", 3)] {
-            if k(none, key) {
-                self.toggle_kind_at(kind, fallback, pos, engine);
+        // Per-track keys (default Q/W/E/R): toggle a hit at the playhead on that track.
+        let keys = project::effective_keys(&self.project.content.tracks);
+        for (ti, name) in keys.into_iter().enumerate() {
+            if let Some(key) = name.as_deref().and_then(Key::from_name) {
+                if k(none, key) {
+                    self.toggle_track_at(ti, pos, engine);
+                }
             }
         }
 
@@ -2339,7 +2489,8 @@ impl Work {
             }
         }
 
-        if k(none, Key::Escape) {
+        let popup_open = ctx.any_popup_open() || ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("theme-roll"))).unwrap_or(false);
+        if !popup_open && k(none, Key::Escape) {
             if self.show_keys || self.export_open || self.confirm_clear || self.confirm_remove.is_some() {
                 self.show_keys = false;
                 self.export_open = false;
@@ -2532,18 +2683,17 @@ impl Work {
         let measure = rl.beat_length * rl.meter as f64;
         let measures = (((max - min) as f64 + 1.0) / measure).ceil().max(1.0);
         let shift = (measure * measures).round() as i64;
+        let saved = std::mem::take(&mut self.clipboard);
         self.copy_selection();
         self.paste_at(min + shift, engine);
+        self.clipboard = saved;
     }
 
-    /// Q/W/E/R: toggle a hit on the track whose sample is that kind of hitsound.
-    fn toggle_kind_at(&mut self, kind: &str, fallback: usize, pos: f64, engine: Option<&Engine>) {
-        let tracks = &self.project.content.tracks;
-        let ti = tracks
-            .iter()
-            .position(|t| t.sample.as_ref().is_some_and(|s| s.file.to_ascii_lowercase().contains(kind)))
-            .or_else(|| (fallback < tracks.len()).then_some(fallback));
-        let Some(ti) = ti else { return };
+    /// Toggle a hit at the playhead (snapped) on track `ti`.
+    fn toggle_track_at(&mut self, ti: usize, pos: f64, engine: Option<&Engine>) {
+        if ti >= self.project.content.tracks.len() {
+            return;
+        }
         let t = self.snap(pos).max(0);
         self.checkpoint();
         let tid = self.project.content.tracks[ti].id;
@@ -2555,6 +2705,114 @@ impl Work {
         }
         self.changed(engine);
     }
+
+    /// Handle the key press that assigns a track's hit key. Returns true if a key was consumed.
+    fn capture_key(&mut self, ctx: &egui::Context, id: u64, engine: Option<&Engine>) -> bool {
+        let _ = engine;
+        let pressed = ctx.input_mut(|i| {
+            let mut found = None;
+            i.events.retain(|e| {
+                if found.is_none() {
+                    if let Event::Key { key, physical_key, pressed: true, modifiers, .. } = e {
+                        if !modifiers.command && !modifiers.alt {
+                            found = Some(physical_key.unwrap_or(*key));
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            found
+        });
+        let Some(key) = pressed else { return false };
+        let Some(ti) = self.track_index(id) else {
+            self.capturing_key = None;
+            return true;
+        };
+        match key {
+            Key::Escape => {}
+            Key::Backspace | Key::Delete => {
+                self.checkpoint();
+                self.project.content.tracks[ti].key = Some(String::new());
+                self.changed(engine);
+                self.toast("Key removed");
+            }
+            k if RESERVED_KEYS.iter().any(|(r, _)| *r == k) => {
+                let what = RESERVED_KEYS.iter().find(|(r, _)| *r == k).map(|(_, w)| *w).unwrap_or("");
+                self.toast(format!("{} is already used for {what}", k.name()));
+                return true; // keep waiting for another key
+            }
+            k => {
+                let name = k.name().to_string();
+                self.checkpoint();
+                // The key moves here: any other track using it loses it.
+                let eff = project::effective_keys(&self.project.content.tracks);
+                for (j, other) in self.project.content.tracks.iter_mut().enumerate() {
+                    if j != ti && eff[j].as_deref() == Some(name.as_str()) {
+                        other.key = Some(String::new());
+                    }
+                }
+                self.project.content.tracks[ti].key = Some(name.clone());
+                self.changed(engine);
+                self.toast(format!("{} now uses {name}", self.project.content.tracks[ti].name));
+            }
+        }
+        self.capturing_key = None;
+        true
+    }
+}
+
+/// Keys the editor already uses without modifiers, so they can't be track keys.
+const RESERVED_KEYS: &[(Key, &str)] = &[
+    (Key::Space, "play / pause"),
+    (Key::C, "play / pause"),
+    (Key::X, "play from start"),
+    (Key::Z, "jump to first hit"),
+    (Key::V, "jump to last hit"),
+    (Key::J, "nudge back"),
+    (Key::K, "nudge forward"),
+    (Key::Num1, "the Select tool"),
+    (Key::Num2, "the Place tool"),
+    (Key::ArrowLeft, "seeking"),
+    (Key::ArrowRight, "seeking"),
+    (Key::ArrowUp, "seeking"),
+    (Key::ArrowDown, "seeking"),
+    (Key::Home, "going to the start"),
+    (Key::Enter, "confirming"),
+    (Key::Tab, "moving focus"),
+];
+
+/// The small key cap on a track header. Defaults are drawn dimmer.
+fn key_badge(ui: &mut egui::Ui, pal: &Palette, key: Option<&str>, is_default: bool, capturing: bool) -> egui::Response {
+    let label = if capturing {
+        "?".to_string()
+    } else {
+        key.map(|k| if k.chars().count() > 3 { k.chars().take(3).collect() } else { k.to_string() }).unwrap_or_else(|| "–".into())
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 22.0), Sense::click());
+    let (fill, stroke, text) = if capturing {
+        (pal.accent.gamma_multiply(0.25), Stroke::new(1.5, pal.accent), pal.accent)
+    } else if resp.hovered() {
+        (pal.text.gamma_multiply(0.12), Stroke::new(1.0, pal.text_weak), pal.text)
+    } else if is_default || key.is_none() {
+        (Color32::TRANSPARENT, Stroke::new(1.0, pal.border), pal.text_weak)
+    } else {
+        (pal.text.gamma_multiply(0.08), Stroke::new(1.0, pal.text_weak), pal.text)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(5), fill);
+    painter.rect_stroke(rect, CornerRadius::same(5), stroke, StrokeKind::Inside);
+    painter.text(rect.center(), Align2::CENTER_CENTER, label, FontId::monospace(12.0), text);
+    let tip = if capturing {
+        "Press a key for this track · Backspace: no key · Esc: cancel".to_string()
+    } else {
+        match (key, is_default) {
+            (Some(k), true) => format!("Key {k} toggles a hit at the playhead (default). Click to change."),
+            (Some(k), false) => format!("Key {k} toggles a hit at the playhead. Click to change."),
+            (None, _) => "No key. Click to assign one.".to_string(),
+        }
+    };
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Reserve a full-width row and split it into a fixed header column and a lane

@@ -227,7 +227,7 @@ impl Engine {
         let config: cpal::StreamConfig = supported.into();
         let rate = config.sample_rate;
         let channels = config.channels as usize;
-        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, sr: rate as f64, fade: 1.0, ..Default::default() }));
+        let mix = Arc::new(Mutex::new(Mix { song_gain: 0.8, hit_gain: 1.0, master: 1.0, rate: 1.0, sr: rate as f64, fade: 1.0, voices: Vec::with_capacity(128), ..Default::default() }));
         let shared = Arc::new(Shared::default());
         let (m, sh) = (mix.clone(), shared.clone());
         let err = |e| eprintln!("audio stream error: {e}");
@@ -258,11 +258,10 @@ impl Engine {
             m.reset_cursor();
         });
     }
+    /// Replace the sample table. Samples are only ever appended, so voices that are
+    /// still ringing keep pointing at the right sample.
     pub fn set_samples(&self, samples: Vec<Arc<Vec<f32>>>) {
-        self.with(|m| {
-            m.voices.clear();
-            m.samples = samples;
-        });
+        self.with(|m| m.samples = samples);
     }
     pub fn set_events(&self, events: Vec<Event>) {
         let events = Arc::new(events);
@@ -425,7 +424,7 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
             if m.playing && !scrubbing {
                 while m.cursor < m.events.len() && m.events[m.cursor].frame as f64 <= m.pos {
                     let e = m.events[m.cursor];
-                    if m.voices.len() < 96 {
+                    if m.voices.len() < m.voices.capacity().min(96) {
                         m.voices.push(Voice { sample: e.sample, pos: 0, gain: e.gain });
                     }
                     m.cursor += 1;

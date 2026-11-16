@@ -5,9 +5,11 @@ mod audio;
 mod export;
 mod icons;
 mod library;
+mod logo_paths;
 mod osu;
 mod project;
 mod theme;
+mod titlebar;
 
 pub const LOGO_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 

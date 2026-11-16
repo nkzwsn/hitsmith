@@ -377,7 +377,10 @@ pub fn adjacent_tick(lines: &[RedLine], t: f64, div: u32, forward: bool) -> f64 
     } else {
         // Step back from a tick: use the previous section's spacing if we cross a red line.
         let prev = s - red_line_at(lines, s - 1.0).beat_length / div as f64;
-        snap(lines, prev, div).min(s - 0.5)
+        let snapped = snap(lines, prev, div);
+        // If snapping lands back on (or after) where we started, e.g. a section shorter
+        // than half a tick, use the unsnapped step so we always make progress.
+        if snapped < s - 0.5 { snapped } else { prev }
     }
 }
 
@@ -398,5 +401,52 @@ mod tick_tests {
         assert!(adjacent_tick(&lines, a, 4, false) < a);
         // Just before a tick: forward goes to it.
         assert_eq!(adjacent_tick(&lines, 1390.0, 4, true), 1400.0);
+    }
+}
+
+/// Remove `key:` from a section, if present.
+pub fn remove_value(text: &str, section: &str, key: &str) -> String {
+    let header = format!("[{section}]");
+    let mut out = String::with_capacity(text.len());
+    let mut in_section = false;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t == header;
+        } else if in_section && split_kv(t).is_some_and(|(k, _)| k == key) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Add an empty `[section]` just before `[before]` (or at the end) if it is missing.
+pub fn ensure_section(text: &str, section: &str, before: &str) -> String {
+    let header = format!("[{section}]");
+    if text.lines().any(|l| l.trim() == header) {
+        return text.to_string();
+    }
+    let marker = format!("[{before}]");
+    match text.find(&marker) {
+        Some(i) => format!("{}{header}\r\n\r\n{}", &text[..i], &text[i..]),
+        None => format!("{text}\r\n{header}\r\n"),
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    #[test]
+    fn section_helpers() {
+        let t = "[General]\r\nA: 1\r\n\r\n[Metadata]\r\nTitle:x\r\n";
+        let t2 = ensure_section(t, "Editor", "Metadata");
+        assert!(t2.contains("[Editor]\r\n\r\n[Metadata]"));
+        let t3 = set_value(&t2, "Editor", "Bookmarks", "1,2");
+        assert!(t3.contains("Bookmarks:1,2"));
+        let t4 = remove_value(&t3, "Editor", "Bookmarks");
+        assert!(!t4.contains("Bookmarks"));
+        assert_eq!(ensure_section(&t4, "Editor", "Metadata"), t4);
     }
 }
