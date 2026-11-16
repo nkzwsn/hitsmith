@@ -492,6 +492,13 @@ pub fn import_osz(osz: &Path, songs_dir: &Path) -> Result<PathBuf> {
     }
     let file = fs::File::open(osz).with_context(|| format!("opening {}", osz.display()))?;
     let mut archive = zip::ZipArchive::new(file).context("that .osz isn't a valid archive")?;
+    // osu! may already have this mapset under its own folder name ("123456 Artist - Title"):
+    // reuse that instead of unpacking a duplicate.
+    if let Some(meta) = osz_meta(&mut archive) {
+        if let Some(existing) = find_existing_mapset(songs_dir, &meta) {
+            return Ok(existing);
+        }
+    }
     fs::create_dir_all(&target)?;
     let mut total = 0u64;
     for i in 0..archive.len() {
@@ -608,6 +615,102 @@ mod quick_start_tests {
         assert!(!songs.join("evil.txt").exists() && !dir.join("evil.txt").exists(), "zip-slip entry must be skipped");
         // Second import reuses the folder.
         assert_eq!(import_osz(&osz, &songs).unwrap(), out);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Metadata of the first difficulty inside an .osz.
+fn osz_meta(archive: &mut zip::ZipArchive<fs::File>) -> Option<crate::osu::Meta> {
+    use std::io::Read;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).ok()?;
+        if entry.name().is_ok_and(|n| n.to_ascii_lowercase().ends_with(".osu")) && entry.size() < 16 * 1024 * 1024 {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).ok()?;
+            let text = String::from_utf8_lossy(&bytes);
+            return Some(crate::osu::parse_meta(text.trim_start_matches('\u{feff}')));
+        }
+    }
+    None
+}
+
+/// Letters and digits only, lower-cased, so "feat." and "feat" compare equal.
+fn loose(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// Find a folder in `songs_dir` that already holds the same mapset. Candidates are picked
+/// by folder name (cheap), then confirmed by reading one difficulty's metadata.
+pub fn find_existing_mapset(songs_dir: &Path, meta: &crate::osu::Meta) -> Option<PathBuf> {
+    let want_name = loose(&format!("{}{}", meta.artist, meta.title));
+    if want_name.is_empty() {
+        return None;
+    }
+    let id_prefix = (meta.set_id > 0).then(|| format!("{} ", meta.set_id));
+    let mut candidates: Vec<PathBuf> = fs::read_dir(songs_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let by_id = id_prefix.as_ref().is_some_and(|p| name.starts_with(p.as_str()));
+            (by_id || loose(&name).contains(&want_name)).then(|| e.path())
+        })
+        .collect();
+    candidates.sort();
+    // Same mapset = same mapper, artist and title (and set ID when both have one).
+    let same = |other: &crate::osu::Meta| {
+        let ids_agree = meta.set_id <= 0 || other.set_id <= 0 || meta.set_id == other.set_id;
+        ids_agree && loose(&other.creator) == loose(&meta.creator) && loose(&other.title) == loose(&meta.title) && loose(&other.artist) == loose(&meta.artist)
+    };
+    candidates.into_iter().take(20).find(|dir| {
+        let Ok(rd) = fs::read_dir(dir) else { return false };
+        let osu = rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("osu")));
+        osu.and_then(|p| fs::read(p).ok()).is_some_and(|b| same(&crate::osu::parse_meta(String::from_utf8_lossy(&b).trim_start_matches('\u{feff}'))))
+    })
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn osu_text(artist: &str, title: &str, creator: &str, set_id: i64, version: &str) -> String {
+        format!("osu file format v14\r\n\r\n[General]\r\nAudioFilename: audio.mp3\r\n\r\n[Metadata]\r\nTitle:{title}\r\nArtist:{artist}\r\nCreator:{creator}\r\nVersion:{version}\r\nBeatmapSetID:{set_id}\r\n")
+    }
+
+    fn make_osz(path: &Path, osu: &str) {
+        let mut w = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file("map [Hard].osu", opts).unwrap();
+        w.write_all(osu.as_bytes()).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn reuses_the_copy_osu_already_has() {
+        let dir = std::env::temp_dir().join(format!("hitsmith-dupe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let songs = dir.join("Songs");
+        // osu!'s own copy: ID-prefixed folder, punctuation dropped from the name.
+        let existing = songs.join("1884717 40mP feat Hatsune Miku - The Noise of Rain [no video]");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("a [Easy].osu"), osu_text("40mP feat. Hatsune Miku", "The Noise of Rain", "SupaV", 1884717, "Easy")).unwrap();
+        // A different map of the same song by another mapper.
+        let other = songs.join("859370 _namirin - The Noise of Rain");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("b.osu"), osu_text("_namirin", "The Noise of Rain", "someone", 859370, "x")).unwrap();
+
+        let osz = dir.join("40mP feat. Hatsune Miku - The Noise of Rain.osz");
+        make_osz(&osz, &osu_text("40mP feat. Hatsune Miku", "The Noise of Rain", "SupaV", 1884717, "Hard"));
+        assert_eq!(import_osz(&osz, &songs).unwrap(), existing, "must reuse osu!'s folder");
+        assert!(!songs.join("40mP feat. Hatsune Miku - The Noise of Rain").exists(), "no duplicate unpacked");
+
+        // Unsubmitted map (no set ID), same artist/title but a different mapper: unpack fresh.
+        let osz2 = dir.join("My Own - Version.osz");
+        make_osz(&osz2, &osu_text("40mP feat. Hatsune Miku", "The Noise of Rain", "me", -1, "Hard"));
+        let fresh = import_osz(&osz2, &songs).unwrap();
+        assert_eq!(fresh, songs.join("My Own - Version"));
         fs::remove_dir_all(&dir).ok();
     }
 }

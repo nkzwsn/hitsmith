@@ -310,7 +310,12 @@ impl App {
                     .filter(|n| n.to_ascii_lowercase().ends_with(".osu"))
                     .collect();
                 diffs.sort();
-                diffs.into_iter().next().ok_or_else(|| anyhow::anyhow!("No difficulty (.osu) found in {}", dir.display()))?
+                // Prefer the mapset's hitsound difficulty when it has one, else the first.
+                // (but not one hitsmith exported itself).
+                let ours = export::read_manifest(dir).all_files();
+                let hs = diffs.iter().position(|d| d.to_ascii_lowercase().contains("hitsound") && !ours.iter().any(|o| o.eq_ignore_ascii_case(d)));
+                let pick = hs.unwrap_or(0);
+                diffs.into_iter().nth(pick).ok_or_else(|| anyhow::anyhow!("No difficulty (.osu) found in {}", dir.display()))?
             }
         };
         let bm = osu::read_beatmap(&dir.join(&osu_file))?;
@@ -800,6 +805,8 @@ struct Work {
     follow: bool,
     skin_dir: Option<PathBuf>,
     pal: Palette,
+    /// Every difficulty (.osu) in the mapset, for the timing picker.
+    diffs: Vec<String>,
     tool: Tool,
     selected: HashSet<NoteKey>,
     clipboard: Vec<NoteKey>,
@@ -833,6 +840,7 @@ struct Work {
 impl Work {
     fn open(ctx: &egui::Context, entry: ProjectEntry, project: Project, engine: Option<&Engine>) -> anyhow::Result<Self> {
         let bm = osu::read_beatmap(&project.mapset_dir.join(&project.osu_file))?;
+        let diffs = list_diffs(&project.mapset_dir);
         let audio_path = project.mapset_dir.join(&bm.meta.audio_filename);
         let (tx, rx) = mpsc::channel();
         let rate = engine.map(|e| e.rate).unwrap_or(44_100);
@@ -872,6 +880,7 @@ impl Work {
             save_error: None,
             follow: true,
             pal: theme::DARK[0],
+            diffs,
             tool: Tool::Place,
             selected: HashSet::new(),
             clipboard: Vec::new(),
@@ -901,6 +910,23 @@ impl Work {
         }
         w.refresh_library();
         Ok(w)
+    }
+
+    /// Use another difficulty of the mapset for timing (and as the export template).
+    fn switch_timing_diff(&mut self, osu_file: String, engine: Option<&Engine>) {
+        match osu::read_beatmap(&self.project.mapset_dir.join(&osu_file)) {
+            Ok(bm) => {
+                self.project.osu_file = osu_file;
+                self.reds = bm.red_lines;
+                self.meta = bm.meta;
+                self.dirty = true;
+                self.last_edit = Instant::now();
+                self.rebuild_events(engine);
+                let bpm = self.reds.first().map(|r| r.bpm()).unwrap_or(0.0);
+                self.toast(format!("Timing now from this difficulty ({bpm:.0} BPM)"));
+            }
+            Err(e) => self.toast(format!("Couldn't read that difficulty: {e:#}")),
+        }
     }
 
     fn refresh_library(&mut self) {
@@ -1342,7 +1368,25 @@ impl Work {
                 ui.shrink_clip_rect(header);
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Song").size(13.0).strong());
-                ui.label(egui::RichText::new(&self.project.osu_file).size(11.5).color(pal.text_weak));
+                // Which difficulty provides the timing (and the template for export).
+                let current = self.project.osu_file.clone();
+                let shown = current.rsplit_once('[').map(|(_, v)| v.trim_end_matches(".osu").trim_end_matches(']').to_string()).unwrap_or_else(|| current.clone());
+                let mut switch_to = None;
+                egui::ComboBox::from_id_salt("timing-diff")
+                    .width(header.width() - 8.0)
+                    .truncate()
+                    .selected_text(egui::RichText::new(format!("Timing: {shown}")).size(12.0))
+                    .show_ui(ui, |ui| {
+                        for d in self.diffs.iter() {
+                            let label = d.rsplit_once('[').map(|(_, v)| v.trim_end_matches(".osu").trim_end_matches(']').to_string()).unwrap_or_else(|| d.clone());
+                            if ui.selectable_label(*d == current, label).on_hover_text(d.as_str()).clicked() && *d != current {
+                                switch_to = Some(d.clone());
+                            }
+                        }
+                    });
+                if let Some(d) = switch_to {
+                    self.switch_timing_diff(d, engine);
+                }
                 ui.label(egui::RichText::new(format!("{} bookmarks", self.project.bookmarks.len())).size(11.5).color(pal.text_weak));
             }
             self.wave_lane(ui, rect, &resp, pos, engine);
@@ -2914,6 +2958,15 @@ fn key_badge(ui: &mut egui::Ui, pal: &Palette, key: Option<&str>, is_default: bo
         }
     };
     resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Difficulty files (.osu) in a mapset folder, sorted.
+fn list_diffs(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.to_ascii_lowercase().ends_with(".osu")).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
 }
 
 /// Reserve a full-width row and split it into a fixed header column and a lane

@@ -15,6 +15,9 @@ pub struct Meta {
     pub version: String,
     pub audio_filename: String,
     pub background: String,
+    /// osu! beatmap set ID (0 or -1 when unsubmitted).
+    #[serde(default)]
+    pub set_id: i64,
 }
 
 impl Meta {
@@ -91,7 +94,7 @@ fn parse_background(line: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name.to_string()) }
 }
 
-fn parse_meta(text: &str) -> Meta {
+pub fn parse_meta(text: &str) -> Meta {
     let mut meta = Meta::default();
     let mut section = "";
     for raw in text.lines() {
@@ -122,6 +125,7 @@ fn parse_meta(text: &str) -> Meta {
                         "ArtistUnicode" => meta.artist_unicode = v,
                         "Creator" => meta.creator = v,
                         "Version" => meta.version = v,
+                        "BeatmapSetID" => meta.set_id = v.trim().parse().unwrap_or(0),
                         _ => {}
                     }
                 }
