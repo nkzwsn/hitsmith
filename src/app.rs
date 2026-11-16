@@ -318,11 +318,18 @@ impl App {
                     .filter(|n| n.to_ascii_lowercase().ends_with(".osu"))
                     .collect();
                 diffs.sort();
-                // Prefer the mapset's hitsound difficulty when it has one, else the first.
-                // (but not one hitsmith exported itself).
+                // Prefer the mapset's hitsound difficulty when it has one (by name, or by its
+                // objects all stacked on one spot), else the first; never one hitsmith exported itself.
                 let ours = export::read_manifest(dir).all_files();
-                let hs = diffs.iter().position(|d| d.to_ascii_lowercase().contains("hitsound") && !ours.iter().any(|o| o.eq_ignore_ascii_case(d)));
-                let pick = hs.unwrap_or(0);
+                let candidates: Vec<usize> = (0..diffs.len()).filter(|&i| !ours.iter().any(|o| o.eq_ignore_ascii_case(&diffs[i]))).collect();
+                let by_name = candidates.iter().copied().find(|&i| diffs[i].to_ascii_lowercase().contains("hitsound"));
+                let by_content = || {
+                    candidates.iter().copied().find(|&i| {
+                        let text = std::fs::read_to_string(dir.join(&diffs[i])).unwrap_or_default();
+                        crate::hsimport::is_hitsound_diff(&diffs[i], &text)
+                    })
+                };
+                let pick = by_name.or_else(by_content).unwrap_or(0);
                 diffs.into_iter().nth(pick).ok_or_else(|| anyhow::anyhow!("No difficulty (.osu) found in {}", dir.display()))?
             }
         };
@@ -343,7 +350,9 @@ impl App {
         let lib = project::sample_library(&self.projects_dir.join(&name).join("samples"), dir, &bm.meta.audio_filename, library::current_skin_dir(dir).as_deref(), &exported);
         // A hitsound difficulty brings its hits along; otherwise start with empty starter tracks.
         let src_text = std::fs::read_to_string(dir.join(&proj.osu_file)).unwrap_or_default();
-        if proj.osu_file.to_ascii_lowercase().contains("hitsound") && crate::hsimport::has_hits(&src_text) {
+        let ours = export::read_manifest(dir).all_files();
+        let is_ours = ours.iter().any(|o| o.eq_ignore_ascii_case(&proj.osu_file));
+        if !is_ours && crate::hsimport::is_hitsound_diff(&proj.osu_file, &src_text) {
             let imp = crate::hsimport::import(&src_text, &lib, 1);
             proj.content.tracks = imp.tracks;
             proj.content.control_points = imp.control_points;

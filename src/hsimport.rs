@@ -6,7 +6,7 @@
 //! (the mapset's numbered file, or the skin's default when the mapset lacks it),
 //! and the green lines' volumes become volume points.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::project::{ControlPoint, SampleEntry, SampleRef, SampleSource, Track};
 
@@ -230,6 +230,34 @@ pub fn import(text: &str, library: &[SampleEntry], first_id: u64) -> Imported {
 }
 
 /// Does this difficulty contain hitsounds worth importing (any hit objects)?
+/// Whether a difficulty is a hitsound difficulty: named like one, or (whatever its name)
+/// nearly all of its objects stacked on one spot, which is how hitsound difficulties are made.
+pub fn is_hitsound_diff(file_name: &str, text: &str) -> bool {
+    if !has_hits(text) {
+        return false;
+    }
+    if file_name.to_ascii_lowercase().contains("hitsound") {
+        return true;
+    }
+    let mut in_objects = false;
+    let mut spots: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut total = 0usize;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_objects = l == "[HitObjects]";
+        } else if in_objects && !l.is_empty() {
+            let mut f = l.split(',');
+            if let (Some(x), Some(y)) = (f.next(), f.next()) {
+                *spots.entry((x.trim(), y.trim())).or_default() += 1;
+                total += 1;
+            }
+        }
+    }
+    let top = spots.values().copied().max().unwrap_or(0);
+    total >= 16 && top * 10 >= total * 9
+}
+
 pub fn has_hits(text: &str) -> bool {
     let mut in_objects = false;
     for line in text.lines() {
@@ -275,6 +303,22 @@ mod tests {
         // Volumes 70 -> 80.
         assert_eq!(imp.control_points.iter().map(|c| (c.time, c.volume)).collect::<Vec<_>>(), vec![(0, 70), (1000, 80)]);
         assert!(imp.missing.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+
+    #[test]
+    fn hitsound_diff_by_name_or_stacked_objects() {
+        let stacked: String = (0..20).map(|i| format!("256,192,{},1,2,0:0:0:0:\r\n", 1000 + i * 200)).collect();
+        let spread: String = (0..20).map(|i| format!("{},{},{},1,0,0:0:0:0:\r\n", i * 20, i * 10, 1000 + i * 200)).collect();
+        let map = |objs: &str| format!("osu file format v14\r\n[HitObjects]\r\n{objs}");
+        assert!(is_hitsound_diff("A - S (m) [midori's Re:EASY].osu", &map(&stacked)));
+        assert!(!is_hitsound_diff("A - S (m) [Hard].osu", &map(&spread)));
+        assert!(is_hitsound_diff("A - S (m) [Hitsounds].osu", &map(&spread)));
+        assert!(!is_hitsound_diff("A - S (m) [Hitsounds].osu", &map("")));
     }
 }
 
