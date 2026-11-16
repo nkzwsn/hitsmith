@@ -30,11 +30,13 @@ struct Settings {
     dark_palette: usize,
     light_palette: usize,
     scrub_sound: bool,
+    /// Show the "Getting started" guide on the home screen.
+    show_guide: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0, scrub_sound: false }
+        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0, scrub_sound: false, show_guide: true }
     }
 }
 
@@ -341,6 +343,11 @@ impl App {
                     if theme_menu(ui, &mut self.settings) {
                         self.theme_changed = true;
                     }
+                    let tip = if self.settings.show_guide { "Hide the getting-started guide" } else { "Show the getting-started guide" };
+                    if ui.selectable_label(self.settings.show_guide, "Guide").on_hover_text(tip).clicked() {
+                        self.settings.show_guide = !self.settings.show_guide;
+                        self.save_settings();
+                    }
                 });
             });
         });
@@ -356,6 +363,10 @@ impl App {
                         self.home.error = None;
                     }
                 });
+            }
+            if self.settings.show_guide && guide_panel(ui, &pal) {
+                self.settings.show_guide = false;
+                self.save_settings();
             }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Projects").size(24.0).strong());
@@ -520,6 +531,64 @@ impl App {
         }
     }
 
+}
+
+/// The "Getting started" guide on the home screen. Returns true when dismissed.
+fn guide_panel(ui: &mut egui::Ui, pal: &Palette) -> bool {
+    const STEPS: [(Icon, &str, &str); 5] = [
+        (Icon::Plus, "Open a beatmap", "Click New project and pick any difficulty (.osu) of the mapset, or drop a .osu on the window."),
+        (Icon::Music, "Add tracks", "Each track is one hitsound sample. Pick it from the mapset, your skin, or import your own."),
+        (Icon::Pencil, "Place hits", "Click the grid to place a hit, or press a track's key (Q W E R) at the playhead."),
+        (Icon::Speaker, "Shape the volume", "Click the Volume lane to add a point, then drag it up or down."),
+        (Icon::Export, "Export", "Writes a hitsound difficulty and its samples into the mapset folder, ready for osu!."),
+    ];
+    let mut dismissed = false;
+    egui::Frame::new()
+        .fill(pal.panel)
+        .stroke(Stroke::new(1.0, pal.border))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Getting started").size(18.0).strong());
+                    ui.label(egui::RichText::new("Make a hitsound difficulty in five steps.").color(pal.text_weak));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Got it").on_hover_text("Hide this guide (the Guide button brings it back)").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                for (n, (icon, title, text)) in STEPS.iter().enumerate() {
+                    let (rect, _) = ui.allocate_exact_size(vec2(214.0, 116.0), Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, CornerRadius::same(10), pal.bg);
+                    painter.rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, pal.border), StrokeKind::Inside);
+                    // Step number and icon.
+                    let badge = pos2(rect.left() + 22.0, rect.top() + 22.0);
+                    painter.circle_filled(badge, 12.0, pal.accent);
+                    painter.text(badge, Align2::CENTER_CENTER, format!("{}", n + 1), FontId::proportional(13.0), pal.bg);
+                    icons::paint(painter, Rect::from_center_size(pos2(rect.right() - 22.0, rect.top() + 22.0), Vec2::splat(18.0)), *icon, pal.text_weak);
+                    painter.text(pos2(rect.left() + 42.0, badge.y), Align2::LEFT_CENTER, *title, FontId::proportional(14.5), pal.text);
+                    // Description, wrapped inside the card.
+                    let galley = painter.layout(text.to_string(), FontId::proportional(12.0), pal.text_weak, rect.width() - 24.0);
+                    painter.galley(pos2(rect.left() + 12.0, rect.top() + 44.0), galley, pal.text_weak);
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Tip: Space plays, the mouse wheel seeks, Ctrl+wheel changes the snap. The workstation's More menu lists every shortcut.")
+                    .size(12.0)
+                    .color(pal.text_weak),
+            );
+        });
+    ui.add_space(14.0);
+    dismissed
 }
 
 enum CardAction {
