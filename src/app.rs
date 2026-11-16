@@ -333,7 +333,15 @@ impl App {
         // Starter tracks from the mapset's own hitsounds (or the skin's).
         let exported = export::read_manifest(dir).all_files();
         let lib = project::sample_library(&self.projects_dir.join(&name).join("samples"), dir, &bm.meta.audio_filename, library::current_skin_dir(dir).as_deref(), &exported);
-        proj.content.tracks = project::default_tracks(&lib);
+        // A hitsound difficulty brings its hits along; otherwise start with empty starter tracks.
+        let src_text = std::fs::read_to_string(dir.join(&proj.osu_file)).unwrap_or_default();
+        if proj.osu_file.to_ascii_lowercase().contains("hitsound") && crate::hsimport::has_hits(&src_text) {
+            let imp = crate::hsimport::import(&src_text, &lib, 1);
+            proj.content.tracks = imp.tracks;
+            proj.content.control_points = imp.control_points;
+        } else {
+            proj.content.tracks = project::default_tracks(&lib);
+        }
         proj.next_id = proj.content.tracks.len() as u64 + 1;
         let entry = project::create(&self.projects_dir, &name, &proj)?;
         if let Some(songs) = dir.parent() {
@@ -912,6 +920,31 @@ impl Work {
         Ok(w)
     }
 
+    /// Add the timing difficulty's hitsounds as tracks (one per sound) and use its volumes.
+    fn import_hitsounds(&mut self, engine: Option<&Engine>) {
+        let text = match std::fs::read_to_string(self.project.mapset_dir.join(&self.project.osu_file)) {
+            Ok(t) => t,
+            Err(e) => {
+                self.toast(format!("Couldn't read the difficulty: {e}"));
+                return;
+            }
+        };
+        let imp = crate::hsimport::import(&text, &self.library, self.project.next_id);
+        if imp.hits == 0 {
+            self.toast("That difficulty has no hits to import");
+            return;
+        }
+        self.checkpoint();
+        let n_tracks = imp.tracks.len();
+        self.project.next_id += n_tracks as u64;
+        self.project.content.tracks.extend(imp.tracks);
+        self.project.content.control_points = imp.control_points;
+        self.selected.clear();
+        self.changed(engine);
+        let missing = if imp.missing.is_empty() { String::new() } else { format!(" ({} sounds need a sample)", imp.missing.len()) };
+        self.toast(format!("Imported {} hits into {n_tracks} tracks{missing}", imp.hits));
+    }
+
     /// Use another difficulty of the mapset for timing (and as the export template).
     fn switch_timing_diff(&mut self, osu_file: String, engine: Option<&Engine>) {
         match osu::read_beatmap(&self.project.mapset_dir.join(&osu_file)) {
@@ -1183,6 +1216,9 @@ impl Work {
                             e.set_scrub_sound(self.scrub_sound);
                         }
                         self.toast(if self.scrub_sound { "Scrub sound on" } else { "Scrub sound off" });
+                    }
+                    if ui.button("Import hitsounds from timing difficulty").on_hover_text("Add the hits of the difficulty chosen under Song as tracks, with its volume points").clicked() {
+                        self.import_hitsounds(engine);
                     }
                     if ui.button("Open mapset folder").clicked() {
                         let _ = std::process::Command::new("explorer").arg(&self.project.mapset_dir).spawn();

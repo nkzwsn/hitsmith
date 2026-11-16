@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod export;
+mod hsimport;
 mod icons;
 mod library;
 mod logo_paths;
