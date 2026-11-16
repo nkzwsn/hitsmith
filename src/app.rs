@@ -870,6 +870,7 @@ impl Work {
             ctx2.request_repaint();
         });
         let first = bm.red_lines[0].offset;
+        let view_start = project.last_view.unwrap_or(first - 500.0);
         let mut w = Self {
             skin_dir: library::current_skin_dir(&project.mapset_dir),
             entry,
@@ -885,7 +886,7 @@ impl Work {
             sample_errors: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
-            view_start: first - 500.0,
+            view_start,
             dirty: false,
             last_edit: Instant::now(),
             drag: None,
@@ -924,8 +925,9 @@ impl Work {
             e.set_song(Arc::new(Vec::new()));
             e.set_samples(Vec::new());
             e.set_speed(1.0);
-            e.seek_ms(0.0);
+            e.seek_ms(w.project.last_position);
         }
+        w.pos_now = w.project.last_position;
         w.refresh_library();
         Ok(w)
     }
@@ -1065,6 +1067,9 @@ impl Work {
     }
 
     fn save_now(&mut self) {
+        // Remember where you were, so reopening the project puts you back there.
+        self.project.last_position = self.pos_now.max(0.0);
+        self.project.last_view = Some(self.view_start);
         match project::save(&self.entry.json(), &self.project) {
             Ok(()) => {
                 self.dirty = false;
@@ -1122,6 +1127,8 @@ impl Work {
                     Ok(song) => {
                         if let Some(e) = engine {
                             e.set_song(song.pcm.clone());
+                            // set_song rewinds to 0: go back to where you left off.
+                            e.seek_ms(self.project.last_position.min(song.duration_ms));
                         }
                         self.song = Some(song);
                         self.rebuild_events(engine);

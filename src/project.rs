@@ -115,6 +115,11 @@ pub struct Project {
     /// Show tracks as slim one-line rows.
     #[serde(default)]
     pub compact_tracks: bool,
+    /// Where you left off: playhead (ms) and the timeline's left edge (ms).
+    #[serde(default)]
+    pub last_position: f64,
+    #[serde(default)]
+    pub last_view: Option<f64>,
 }
 
 fn default_zoom() -> f32 {
@@ -137,6 +142,8 @@ impl Project {
             next_id: 1,
             bookmarks: Vec::new(),
             compact_tracks: false,
+            last_position: 0.0,
+            last_view: None,
         }
     }
 
