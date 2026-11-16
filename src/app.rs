@@ -843,6 +843,9 @@ struct Work {
     playing_now: bool,
     /// Set while scrolling by hand: Follow waits until shortly after the last scroll.
     follow_hold: Option<Instant>,
+    /// The ruler is being held (playhead dragged); playback resumes on release if it was playing.
+    ruler_held: bool,
+    ruler_resume: bool,
     /// Mirrors the saved setting; the App writes it back when it changes.
     scrub_sound: bool,
 }
@@ -911,6 +914,8 @@ impl Work {
             pos_now: 0.0,
             playing_now: false,
             follow_hold: None,
+            ruler_held: false,
+            ruler_resume: false,
             scrub_sound: false,
         };
         if let Some(e) = engine {
@@ -1934,13 +1939,29 @@ impl Work {
             let tri = vec![pos2(x - 6.0, rect.top() + 4.0), pos2(x + 6.0, rect.top() + 4.0), pos2(x, rect.bottom())];
             painter.add(egui::Shape::convex_polygon(tri, self.pal.playhead, Stroke::NONE));
         }
-        if resp.clicked() || resp.dragged() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let t = self.t_of(rect, p.x).max(0.0);
-                if let Some(e) = engine {
-                    e.seek_ms(t);
+        // Holding the ruler while playing: fade the song out, move silently with the mouse,
+        // and resume from where it's released (re-seeking every frame sounded like a skipping CD).
+        let down = resp.is_pointer_button_down_on() || resp.dragged();
+        if down {
+            if !self.ruler_held {
+                self.ruler_held = true;
+                self.ruler_resume = self.playing_now;
+                if let (true, Some(e)) = (self.ruler_resume, engine) {
+                    e.play(false);
                 }
             }
+            if let (Some(p), Some(e)) = (resp.interact_pointer_pos(), engine) {
+                e.seek_ms(self.t_of(rect, p.x).max(0.0));
+            }
+        } else if self.ruler_held {
+            self.ruler_held = false;
+            if let (Some(p), Some(e)) = (resp.interact_pointer_pos().or(ui.input(|i| i.pointer.latest_pos())), engine) {
+                e.seek_ms(self.t_of(rect, p.x).max(0.0));
+                if self.ruler_resume {
+                    e.play(true);
+                }
+            }
+            self.ruler_resume = false;
         }
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

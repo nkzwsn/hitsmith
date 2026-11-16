@@ -174,6 +174,8 @@ struct Mix {
     pending_jump: Option<f64>,
     /// Song gain used to fade around jumps (0..1).
     fade: f32,
+    /// Pausing: fade the song out, then stop.
+    stopping: bool,
     sr: f64,
     song_gain: f32,
     hit_gain: f32,
@@ -276,12 +278,19 @@ impl Engine {
             m.hit_gain = hits;
         });
     }
+    /// Start or pause playback. Both fade (a few ms) so there's no click.
     pub fn play(&self, on: bool) {
         self.with(|m| {
-            if on && !m.playing {
-                m.reset_cursor();
+            if on {
+                if !m.playing || m.stopping {
+                    m.reset_cursor();
+                    m.fade = 0.0; // fade in
+                }
+                m.playing = true;
+                m.stopping = false;
+            } else if m.playing {
+                m.stopping = true;
             }
-            m.playing = on;
         });
     }
     pub fn is_playing(&self) -> bool {
@@ -292,15 +301,19 @@ impl Engine {
         self.with(|m| m.rate = speed.clamp(0.1, 4.0));
     }
     /// Jump straight to a time (clicks on the ruler, Home, etc.).
+    /// Jump to a time. While playing, the song fades out and back in around the jump.
     pub fn seek_ms(&self, ms: f64) {
         let frame = ms.max(0.0) * self.rate as f64 / 1000.0;
         self.with(|m| {
-            m.pos = frame;
             m.target = None;
-            m.pending_jump = None;
-            m.fade = 1.0;
-            m.vel = m.base_speed();
-            m.reset_cursor();
+            if m.playing && !m.stopping {
+                m.pending_jump = Some(frame);
+            } else {
+                m.pos = frame;
+                m.pending_jump = None;
+                m.vel = m.base_speed();
+                m.reset_cursor();
+            }
         });
     }
     /// Seek by ticks: a vinyl-style glide if scrub sound is on, otherwise an
@@ -391,6 +404,14 @@ fn render<T: Copy>(mix: &Mutex<Mix>, shared: &Shared, out: &mut [T], channels: u
                 m.pos = to;
                 m.pending_jump = None;
                 m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
+            }
+        } else if m.stopping {
+            m.fade -= fade_step;
+            if m.fade <= 0.0 {
+                // Faded out: now actually pause.
+                m.fade = 0.0;
+                m.playing = false;
+                m.stopping = false;
             }
         } else if m.fade < 1.0 {
             m.fade = (m.fade + fade_step).min(1.0);
@@ -577,5 +598,26 @@ mod jump_tests {
         let min = buf.iter().step_by(2).cloned().fold(f32::MAX, f32::min);
         assert!(min < 0.01, "fade should dip near silence");
         assert!(m.fade > 0.99);
+    }
+}
+
+#[cfg(test)]
+mod fade_tests {
+    use super::*;
+
+    fn mix() -> Mutex<Mix> {
+        Mutex::new(Mix { song: Arc::new(vec![10000i16; 48_000 * 2 * 4]), pos: 48_000.0, rate: 1.0, playing: true, sr: 48_000.0, fade: 1.0, song_gain: 1.0, hit_gain: 1.0, master: 1.0, ..Default::default() })
+    }
+
+    #[test]
+    fn pause_fades_out_then_stops() {
+        let m = mix();
+        m.lock().unwrap().stopping = true;
+        let mut buf = vec![0f32; 2 * 480];
+        render(&m, &Shared::default(), &mut buf, 2, |v| v);
+        let g = m.lock().unwrap();
+        assert!(!g.playing, "paused after the fade");
+        assert!(buf[0] > 0.1 && buf[2 * 100] < buf[0], "level ramps down instead of cutting");
+        assert!(buf[2 * 479].abs() < 1e-6, "silent at the end");
     }
 }
