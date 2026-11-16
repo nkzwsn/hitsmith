@@ -1987,7 +1987,9 @@ impl Work {
                         t.volume = v.clamp(0.0, 100.0) as u8;
                         live_volume = true;
                         wheeled = true;
-                        ui.data_mut(|d| d.insert_temp(wheel_id, ui.input(|i| i.time)));
+                        // Read the time first: calling ui.input inside ui.data_mut locks egui twice and freezes.
+                        let now = ui.input(|i| i.time);
+                        ui.data_mut(|d| d.insert_temp(wheel_id, now));
                         ui.ctx().request_repaint_after(Duration::from_millis(700));
                     }
                 }
