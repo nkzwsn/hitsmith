@@ -13,7 +13,7 @@ use crate::theme::Palette;
 /// Remembers what was applied last, so the window is only touched when colours change.
 #[derive(Default)]
 pub struct TitleBar {
-    last: Option<(Color32, Color32, bool)>,
+    last: Option<(Color32, Color32, bool, Option<eframe::egui::Theme>)>,
 }
 
 fn colorref(c: Color32) -> u32 {
@@ -22,8 +22,10 @@ fn colorref(c: Color32) -> u32 {
 }
 
 impl TitleBar {
-    pub fn apply(&mut self, frame: &eframe::Frame, pal: &Palette) {
-        let want = (pal.bg, pal.text, pal.dark);
+    /// `system` is Windows' own light/dark setting; when it changes the window may reset
+    /// its caption, so the colours are applied again.
+    pub fn apply(&mut self, frame: &eframe::Frame, pal: &Palette, system: Option<eframe::egui::Theme>) {
+        let want = (pal.bg, pal.text, pal.dark, system);
         if self.last == Some(want) {
             return;
         }

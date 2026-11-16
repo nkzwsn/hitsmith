@@ -176,6 +176,8 @@ pub struct App {
     pal: Palette,
     theme_changed: bool,
     titlebar: crate::titlebar::TitleBar,
+    /// Palette the window icon was last drawn in.
+    icon_palette: Option<(&'static str, bool)>,
 }
 
 fn data_dir() -> PathBuf {
@@ -246,7 +248,7 @@ impl App {
         };
         let theme = ThemeState::new(settings.palette());
         let pal = *theme.target();
-        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, titlebar: Default::default() };
+        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, titlebar: Default::default(), icon_palette: None };
         app.refresh_projects();
         app
     }
@@ -641,7 +643,16 @@ impl eframe::App for App {
         }
         self.pal = self.theme.apply(&ctx);
         // The native title bar blends along with the rest of the theme.
-        self.titlebar.apply(frame, &self.pal);
+        self.titlebar.apply(frame, &self.pal, ctx.system_theme());
+        // The window/taskbar icon is redrawn in the new palette once a theme is picked.
+        let target = *self.theme.target();
+        // Wait a couple of frames: an icon sent while the window is still being created is dropped.
+        if self.icon_palette != Some((target.name, target.dark)) && ctx.cumulative_frame_nr() >= 2 {
+            self.icon_palette = Some((target.name, target.dark));
+            let size = 32;
+            let rgba = icons::logo_rgba(size, &target);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(egui::IconData { rgba, width: size, height: size }))));
+        }
         let mut go_home = false;
         match &mut self.screen {
             Screen::Home => self.home_ui(ui),
@@ -777,6 +788,8 @@ struct Work {
     confirm_clear: bool,
     /// Track id whose hit key is being reassigned (waiting for a key press).
     capturing_key: Option<u64>,
+    /// A key cap was clicked this frame (so that click doesn't cancel the capture).
+    capture_clicked: bool,
     /// Saving failed while leaving: ask whether to retry, leave anyway or stay.
     leave_prompt: bool,
     /// The user chose to leave without saving.
@@ -844,6 +857,7 @@ impl Work {
             show_keys: false,
             confirm_clear: false,
             capturing_key: None,
+            capture_clicked: false,
             leave_prompt: false,
             force_leave: false,
             close_after_leave: false,
@@ -864,6 +878,7 @@ impl Work {
     }
 
     fn refresh_library(&mut self) {
+        self.sample_errors.clear();
         let exported = export::read_manifest(&self.project.mapset_dir).all_files();
         self.library = Arc::new(project::sample_library(&self.entry.samples_dir(), &self.project.mapset_dir, &self.meta.audio_filename, self.skin_dir.as_deref(), &exported));
     }
@@ -1042,6 +1057,7 @@ impl Work {
                 self.confirm_remove = None;
                 self.confirm_clear = false;
                 self.leave_prompt = false;
+                self.close_after_leave = false;
             }
         } else if !typing && self.handle_keys(&ctx, engine, playing, pos) {
             go_home = true;
@@ -1549,6 +1565,15 @@ impl Work {
             });
             self.export_open = open;
         }
+        // Key capture ends if its track is gone, a rename starts, or you click anywhere else.
+        if let Some(id) = self.capturing_key {
+            let clicked_elsewhere = ctx.input(|i| i.pointer.any_click()) && !self.capture_clicked;
+            if self.track_index(id).is_none() || self.renaming.is_some() || clicked_elsewhere {
+                self.capturing_key = None;
+            }
+        }
+        self.capture_clicked = false;
+
         // A drag whose widget vanished (e.g. undo removed the track) never gets its
         // "stopped" event; drop it once the mouse is released.
         if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) {
@@ -1576,6 +1601,8 @@ impl Work {
             (t.sample.clone(), t.volume, t.muted, t.solo)
         };
         let mut volume_before = before.1;
+        let mut live_volume = false;
+        let mut retry_sample: Option<PathBuf> = None;
         let t = &mut self.project.content.tracks[ti];
         let color = pal.tracks[t.color as usize % 8];
 
@@ -1637,43 +1664,68 @@ impl Work {
                 }
             });
         });
-        ui.horizontal(|ui| {
-            let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sample".into());
-            egui::ComboBox::from_id_salt(("sample", t.id)).width(140.0).selected_text(egui::RichText::new(label).size(12.5)).show_ui(ui, |ui| {
-                let mut last = None;
-                for e in library.iter() {
-                    if last != Some(e.r.source) {
-                        ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
-                        last = Some(e.r.source);
-                    }
-                    let sel = t.sample.as_ref() == Some(&e.r);
-                    if ui.selectable_label(sel, &e.r.file).clicked() && !sel {
-                        t.sample = Some(e.r.clone());
-                        edited = true;
-                        settings_changed = true;
-                        audition = Some((e.r.clone(), t.volume));
-                    }
-                }
-            });
-            ui.spacing_mut().slider_width = 48.0;
-            let vol_id = egui::Id::unique(("vol-drag-start", t.id));
-            let vol_at_start = t.volume;
-            let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Track volume");
-            if r.drag_started() {
-                ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
-            }
-            ui.label(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak));
-            if r.drag_stopped() {
-                volume_before = ui.data(|d| d.get_temp::<u8>(vol_id)).unwrap_or(vol_at_start);
-                edited = true;
-                settings_changed = true;
-            } else if r.changed() && !r.dragged() {
-                edited = true;
-                settings_changed = true;
-            }
+        // Second row in fixed columns, laid out from the right edge: key cap (under the
+        // trash icon), volume %, volume slider, then the sample picker fills the rest.
+        // That keeps every track's controls lined up whatever the sample name is.
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             if key_badge(ui, &pal, eff_key.as_deref(), t.key.is_none(), capturing == Some(t.id)).clicked() {
                 start_capture = true;
             }
+            ui.add_sized(vec2(32.0, 20.0), egui::Label::new(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak)));
+            ui.spacing_mut().slider_width = 52.0;
+            // One undo step per gesture: remember the volume when the press starts,
+            // compare when it's released.
+            let vol_id = egui::Id::unique(("vol-gesture-start", t.id));
+            let vol_at_start = t.volume;
+            let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Track volume");
+            let held = r.is_pointer_button_down_on() || r.dragged();
+            let started: Option<u8> = ui.data(|d| d.get_temp(vol_id));
+            if held && started.is_none() {
+                ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
+            }
+            if r.changed() {
+                live_volume = true; // hear it while dragging
+            }
+            if !held {
+                if let Some(start) = started {
+                    ui.data_mut(|d| d.remove::<u8>(vol_id));
+                    if start != t.volume {
+                        volume_before = start;
+                        edited = true;
+                        settings_changed = true;
+                    }
+                } else if r.changed() {
+                    // Keyboard change on the focused slider.
+                    edited = true;
+                    settings_changed = true;
+                }
+            }
+            let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sample".into());
+            let width = ui.available_width();
+            egui::ComboBox::from_id_salt(("sample", t.id))
+                .width(width)
+                .truncate()
+                .selected_text(egui::RichText::new(label).size(12.5))
+                .show_ui(ui, |ui| {
+                    let mut last = None;
+                    for e in library.iter() {
+                        if last != Some(e.r.source) {
+                            ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
+                            last = Some(e.r.source);
+                        }
+                        let sel = t.sample.as_ref() == Some(&e.r);
+                        if ui.selectable_label(sel, &e.r.file).clicked() {
+                            retry_sample = Some(e.path.clone());
+                            if !sel {
+                                t.sample = Some(e.r.clone());
+                                settings_changed = true;
+                            }
+                            edited = true;
+                            audition = Some((e.r.clone(), t.volume));
+                        }
+                    }
+                });
         });
         match commit_rename {
             Some(Some(b)) if b.starts_with('\u{0}') => {
@@ -1691,6 +1743,9 @@ impl Work {
             }
             Some(None) => self.renaming = None,
             None => {}
+        }
+        if let Some(path) = retry_sample {
+            self.sample_errors.remove(&path);
         }
         if settings_changed {
             // Undo snapshot = the project as it was before this change.
@@ -1710,11 +1765,14 @@ impl Work {
             self.dirty = true;
             self.last_edit = Instant::now();
             self.rebuild_events(engine);
+        } else if live_volume {
+            self.rebuild_events(engine);
         }
         if remove {
             self.confirm_remove = Some(self.project.content.tracks[ti].id);
         }
         if start_capture {
+            self.capture_clicked = true;
             let id = self.project.content.tracks[ti].id;
             self.capturing_key = if self.capturing_key == Some(id) { None } else { Some(id) };
         }
@@ -2216,7 +2274,8 @@ impl Work {
         }
         if let Some(path) = self.project.content.tracks[ti].sample.as_ref().and_then(|s| self.sample_path(s)) {
             if let Some(err) = self.sample_errors.get(&path) {
-                painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Can't play sample: {err}"), FontId::proportional(11.0), self.pal.danger);
+                let short = err.replace(&path.display().to_string(), &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Can't play sample: {short}"), FontId::proportional(11.0), self.pal.danger);
             }
         } else if let Some(s) = &self.project.content.tracks[ti].sample {
             painter.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("Missing sample: {}", s.file), FontId::proportional(11.0), self.pal.danger);
@@ -2269,11 +2328,21 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
 /// Consume a key press whose modifiers match exactly. Also matches the physical
 /// key, so Shift+1 works even though the logical key is "!".
 fn take_key(ctx: &egui::Context, mods: Modifiers, key: Key) -> bool {
+    // Holding a key only repeats for keys that are meant to be held (seeking, nudging);
+    // otherwise holding Space or a track key would toggle over and over.
+    let repeats = matches!(key, Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown | Key::J | Key::K);
+    // Match the key's label (logical key), so shortcuts follow the user's keyboard layout.
+    // Digits also match their position, so Shift+1 still works although its label is "!".
+    let is_digit = matches!(key, Key::Num0 | Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7 | Key::Num8 | Key::Num9);
     ctx.input_mut(|i| {
         let mut hit = false;
         i.events.retain(|e| {
-            if let Event::Key { key: k, physical_key, pressed: true, modifiers: m, .. } = e {
-                if !hit && (*k == key || *physical_key == Some(key)) && m.matches_exact(mods) {
+            if let Event::Key { key: k, physical_key, pressed: true, repeat, modifiers: m, .. } = e {
+                let same = *k == key || (is_digit && *physical_key == Some(key));
+                if !hit && same && m.matches_exact(mods) {
+                    if *repeat && !repeats {
+                        return false; // swallow the repeat, but don't act on it
+                    }
                     hit = true;
                     return false;
                 }
@@ -2713,9 +2782,10 @@ impl Work {
             let mut found = None;
             i.events.retain(|e| {
                 if found.is_none() {
-                    if let Event::Key { key, physical_key, pressed: true, modifiers, .. } = e {
+                    if let Event::Key { key, pressed: true, repeat: false, modifiers, .. } = e {
                         if !modifiers.command && !modifiers.alt {
-                            found = Some(physical_key.unwrap_or(*key));
+                            // The key as labelled on the user's keyboard (works on AZERTY etc.).
+                            found = Some(*key);
                             return false;
                         }
                     }
@@ -2787,7 +2857,12 @@ fn key_badge(ui: &mut egui::Ui, pal: &Palette, key: Option<&str>, is_default: bo
     let label = if capturing {
         "?".to_string()
     } else {
-        key.map(|k| if k.chars().count() > 3 { k.chars().take(3).collect() } else { k.to_string() }).unwrap_or_else(|| "–".into())
+        key.map(|k| {
+            // Show the key's symbol (";" rather than "Semicolon"), shortened if still long.
+            let shown = Key::from_name(k).map(|k| k.symbol_or_name().to_string()).unwrap_or_else(|| k.to_string());
+            if shown.chars().count() > 4 { shown.chars().take(3).collect() } else { shown }
+        })
+        .unwrap_or_else(|| "–".into())
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 22.0), Sense::click());
     let (fill, stroke, text) = if capturing {

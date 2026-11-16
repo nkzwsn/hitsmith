@@ -281,3 +281,99 @@ pub fn group<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R
         .show(ui, |ui| ui.horizontal(|ui| add(ui)).inner)
         .inner
 }
+
+/// Rasterize the logo (on its rounded tile) to RGBA pixels in the given palette,
+/// for the window/taskbar icon. Same geometry and look as assets/make_logo.py.
+pub fn logo_rgba(size: u32, pal: &Palette) -> Vec<u8> {
+    use crate::logo_paths::{MASKS, PATHS, STROKE};
+    let tile = pal.panel;
+    let half = STROKE.max(1.3 * 256.0 / size as f32) / 2.0;
+    let seg_d2 = |px: f32, py: f32, a: (f32, f32), b: (f32, f32)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 == 0.0 { 0.0 } else { (((px - a.0) * dx + (py - a.1) * dy) / l2).clamp(0.0, 1.0) };
+        let (qx, qy) = (a.0 + t * dx - px, a.1 + t * dy - py);
+        qx * qx + qy * qy
+    };
+    let inside = |x: f32, y: f32, poly: &[(f32, f32)]| {
+        let mut sign = 0.0f32;
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            let c = (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0);
+            if c != 0.0 {
+                if sign == 0.0 {
+                    sign = c.signum();
+                } else if c.signum() != sign {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    // Segments with their colour role, closed paths wrapped around.
+    let mut segs: Vec<((f32, f32), (f32, f32), u8)> = Vec::new();
+    for &(role, closed, pts) in PATHS {
+        for w in pts.windows(2) {
+            segs.push((w[0], w[1], role));
+        }
+        if closed {
+            segs.push((pts[pts.len() - 1], pts[0], role));
+        }
+    }
+    let ss = 3;
+    let scale = 256.0 / size as f32;
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    for py in 0..size {
+        for px in 0..size {
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..ss {
+                for sx in 0..ss {
+                    let x = (px as f32 + (sx as f32 + 0.5) / ss as f32) * scale;
+                    let y = (py as f32 + (sy as f32 + 0.5) / ss as f32) * scale;
+                    let (cx, cy) = (x.clamp(56.0, 200.0), y.clamp(56.0, 200.0));
+                    if (x - cx).powi(2) + (y - cy).powi(2) > 56.0 * 56.0 {
+                        continue; // outside the rounded tile
+                    }
+                    let masked = MASKS.iter().any(|m| inside(x, y, m));
+                    let mut col = tile;
+                    for &(a, bb, role) in &segs {
+                        if (role == 1 || !masked) && seg_d2(x, y, a, bb) <= half * half {
+                            col = if role == 0 { pal.accent } else { pal.text };
+                            if role == 1 {
+                                break;
+                            }
+                        }
+                    }
+                    r += col.r() as u32;
+                    g += col.g() as u32;
+                    b += col.b() as u32;
+                    n += 1;
+                }
+            }
+            let i = ((py * size + px) * 4) as usize;
+            if n > 0 {
+                out[i] = (r / n) as u8;
+                out[i + 1] = (g / n) as u8;
+                out[i + 2] = (b / n) as u8;
+                out[i + 3] = (255 * n / (ss * ss)) as u8;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod logo_tests {
+    #[test]
+    fn logo_uses_palette_colours() {
+        let pal = crate::theme::LIGHT[4];
+        let px = super::logo_rgba(64, &pal);
+        assert_eq!(px.len(), 64 * 64 * 4);
+        let has = |c: eframe::egui::Color32| px.chunks(4).any(|p| p[3] == 255 && p[0] == c.r() && p[1] == c.g() && p[2] == c.b());
+        assert!(has(pal.panel), "tile in panel colour");
+        assert!(has(pal.accent), "drum in accent colour");
+        assert!(has(pal.text), "anvil in text colour");
+        // Corners are transparent (rounded tile).
+        assert_eq!(px[3], 0);
+    }
+}
