@@ -21,6 +21,7 @@ fn main() -> eframe::Result {
         let (width, height) = img.dimensions();
         viewport = viewport.with_icon(std::sync::Arc::new(eframe::egui::IconData { rgba: img.into_raw(), width, height }));
     }
+    // eframe's default vsync makes frames follow the monitor's refresh rate (60, 144, 240 Hz...).
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("hitsmith", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }

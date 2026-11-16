@@ -11,8 +11,9 @@ A lightweight hitsounding workstation for osu! mappers, written in Rust.
 
 1. Drop a mapset (`.osz`), a mapset folder, or any difficulty (`.osu`) onto the window, or click **New project**.
    A `.osz` is unpacked into your osu! Songs folder, like osu! does. hitsmith creates the project and
-   Normal / Whistle / Finish / Clap tracks using the mapset's own hitsound samples (or your skin's).
-2. Click the grid to place hits, or press a track's key (Q/W/E/R by default) at the playhead.
+   Normal / Whistle / Finish / Clap samples using the mapset's own sound files (or your skin's).
+   If the timing difficulty is a hitsound difficulty, its hits are imported too.
+2. Click the grid to place hits, or press a sample's key (Q/W/E/R by default) at the playhead.
 3. Use the **Volume** lane to add volume points. **Export** writes a hitsound difficulty into the mapset folder.
 
 Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the full list):
@@ -26,7 +27,7 @@ Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the
 | Alt+wheel | Zoom |
 | Ctrl+Up / Down | Playback speed (25% steps, Shift: 5%) |
 | 1 / 2 | Select tool / Place tool |
-| Track keys (default Q / W / E / R) | Toggle a hit at the playhead on that track; click a track's key cap to change it |
+| Sample keys (default Q / W / E / R) | Toggle a hit at the playhead on that sample; click a sample's key cap to change it |
 | Ctrl+A / X / C / V / D, Delete, J / K | Select all, cut, copy, paste, clone, delete, nudge |
 | Ctrl+B, Ctrl+Shift+B, Ctrl+Left / Right | Add, remove, jump between bookmarks |
 | Ctrl+Shift+P, Ctrl+I | Add / delete a volume point |

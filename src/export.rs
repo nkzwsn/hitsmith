@@ -126,10 +126,10 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
             continue;
         }
         let Some(r) = &track.sample else {
-            bail!("Track \"{}\" has notes but no sample selected.", track.name);
+            bail!("Sample \"{}\" has hits but no sound file selected.", track.name);
         };
         let Some(path) = paths.get(r) else {
-            bail!("Sample \"{}\" used by track \"{}\" is missing.", r.file, track.name);
+            bail!("Sound file \"{}\" used by sample \"{}\" is missing.", r.file, track.name);
         };
         for &t in &track.notes {
             moments.entry(t).or_default().push((path.clone(), track.volume as u32 * 10));

@@ -19,6 +19,8 @@ const RULER_H: f32 = 20.0;
 const WAVE_H: f32 = 84.0;
 const LANE_H: f32 = 76.0;
 const ROW_H: f32 = 68.0;
+/// Row height in compact mode.
+const ROW_H_COMPACT: f32 = 36.0;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -508,7 +510,7 @@ impl App {
 /// The "Getting started" guide on the home screen. Returns true when dismissed.
 fn guide_panel(ui: &mut egui::Ui, pal: &Palette) -> bool {
     const STEPS: [(Icon, &str, &str); 3] = [
-        (Icon::Pencil, "Place hits", "Click the grid to place a hit, or press a track's key (Q W E R) at the playhead."),
+        (Icon::Pencil, "Place hits", "Click the grid to place a hit, or press a sample's key (Q W E R) at the playhead."),
         (Icon::Speaker, "Shape the volume", "Click the Volume lane to add a point, then drag it up or down."),
         (Icon::Export, "Export", "Writes a hitsound difficulty and its samples into the mapset folder, ready for osu!."),
     ];
@@ -523,7 +525,7 @@ fn guide_panel(ui: &mut egui::Ui, pal: &Palette) -> bool {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("Getting started").size(18.0).strong());
-                    ui.label(egui::RichText::new("Drop a mapset (.osz) or its folder anywhere on this window, or click New project. hitsmith sets up the project and Normal / Whistle / Finish / Clap tracks for you. Then:").color(pal.text_weak));
+                    ui.label(egui::RichText::new("Drop a mapset (.osz) or its folder anywhere on this window, or click New project. hitsmith sets up the project and Normal / Whistle / Finish / Clap samples for you. Then:").color(pal.text_weak));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Got it").on_hover_text("Hide this guide (the Guide button brings it back)").clicked() {
@@ -807,7 +809,7 @@ struct Work {
     drag: Option<Drag>,
     export_open: bool,
     export_result: Option<Result<String, String>>,
-    /// Track id waiting for "Remove track?" confirmation.
+    /// Track id waiting for "Remove sample?" confirmation.
     confirm_remove: Option<u64>,
     save_error: Option<String>,
     follow: bool,
@@ -949,8 +951,8 @@ impl Work {
         self.project.content.control_points = imp.control_points;
         self.selected.clear();
         self.changed(engine);
-        let missing = if imp.missing.is_empty() { String::new() } else { format!(" ({} sounds need a sample)", imp.missing.len()) };
-        self.toast(format!("Imported {} hits into {n_tracks} tracks{missing}", imp.hits));
+        let missing = if imp.missing.is_empty() { String::new() } else { format!(" ({} need a sound file)", imp.missing.len()) };
+        self.toast(format!("Imported {} hits into {n_tracks} samples{missing}", imp.hits));
     }
 
     /// Use another difficulty of the mapset for timing (and as the export template).
@@ -1107,7 +1109,7 @@ impl Work {
         // Prefer a sample no other track uses yet.
         let used: Vec<&SampleRef> = self.project.content.tracks.iter().filter_map(|t| t.sample.as_ref()).collect();
         let sample = self.library.iter().find(|e| !used.contains(&&e.r)).or(self.library.first()).map(|e| e.r.clone());
-        self.project.content.tracks.push(Track { id, name: format!("Track {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % 8) as u8, notes: Vec::new(), key: None });
+        self.project.content.tracks.push(Track { id, name: format!("Sample {}", n + 1), sample, volume: 80, muted: false, solo: false, color: (n % 8) as u8, notes: Vec::new(), key: None });
         self.changed(engine);
     }
 
@@ -1133,7 +1135,12 @@ impl Work {
             self.save_now();
         }
         let playing = engine.map(|e| e.is_playing()).unwrap_or(false);
-        let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        let mut pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        // Prediction can overshoot a hair before the next audio report; never step backwards
+        // by such tiny amounts (real backward seeks are much larger than this).
+        if playing && pos < self.pos_now && self.pos_now - pos < 6.0 {
+            pos = self.pos_now;
+        }
         // Starting playback turns Follow back on (scrolling by hand turns it off).
         if playing && !self.playing_now {
             self.follow = true;
@@ -1208,7 +1215,7 @@ impl Work {
                 }
                 ui.menu_button(egui::RichText::new("More").size(14.0), |ui| {
                     ui.set_min_width(220.0);
-                    if ui.button("Import sample…").on_hover_text("Copy .wav/.ogg/.mp3 files into this project").clicked() {
+                    if ui.button("Import sound files…").on_hover_text("Copy .wav/.ogg/.mp3 files into this project so samples can use them").clicked() {
                         if let Some(files) = rfd::FileDialog::new().add_filter("Audio", &project::AUDIO_EXTS).pick_files() {
                             let n = files.len();
                             for f in files {
@@ -1217,7 +1224,7 @@ impl Work {
                                 }
                             }
                             self.refresh_library();
-                            self.toast(format!("Imported {n} sample{}", if n == 1 { "" } else { "s" }));
+                            self.toast(format!("Imported {n} sound file{}", if n == 1 { "" } else { "s" }));
                         }
                     }
                     if ui.button("Keyboard shortcuts").clicked() {
@@ -1229,7 +1236,7 @@ impl Work {
                         }
                         self.toast(if self.scrub_sound { "Scrub sound on" } else { "Scrub sound off" });
                     }
-                    if ui.button("Import hitsounds from timing difficulty").on_hover_text("Add the hits of the difficulty chosen under Song as tracks, with its volume points").clicked() {
+                    if ui.button("Import hitsounds from timing difficulty").on_hover_text("Add the hits of the difficulty chosen under Song as samples, with its volume points").clicked() {
                         self.import_hitsounds(engine);
                     }
                     if ui.button("Open mapset folder").clicked() {
@@ -1282,6 +1289,14 @@ impl Work {
                         self.follow = !self.follow;
                     }
                 });
+                ui.add_space(6.0);
+                icons::group(ui, &pal, |ui| {
+                    let n = self.project.content.tracks.len();
+                    if icons::chip(ui, &pal, "Compact", self.project.compact_tracks, &format!("Slim one-line rows to see all {n} samples at once")).clicked() {
+                        self.project.compact_tracks = !self.project.compact_tracks;
+                        self.dirty = true;
+                    }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().slider_width = 80.0;
                     icons::group(ui, &pal, |ui| {
@@ -1318,7 +1333,9 @@ impl Work {
                     self.follow_hold = Some(Instant::now());
                 }
                 let sel = self.selected.len();
-                let info = if sel > 0 { format!("{sel} selected") } else { format!("{} hits", self.project.content.tracks.iter().map(|t| t.notes.len()).sum::<usize>()) };
+                let n_tracks = self.project.content.tracks.len();
+                let hits: usize = self.project.content.tracks.iter().map(|t| t.notes.len()).sum();
+                let info = if sel > 0 { format!("{sel} selected") } else { format!("{n_tracks} samples · {hits} hits") };
                 ui.label(egui::RichText::new(info).size(12.0).color(pal.text_weak));
                 let speed_text = format!("{:.0}% speed", self.speed * 100.0);
                 if ui.add(egui::Button::new(egui::RichText::new(speed_text).size(12.0)).frame(false)).on_hover_text("Ctrl+Up/Down: 25% steps, Ctrl+Shift+Up/Down: 5%. Click to reset.").clicked() {
@@ -1408,9 +1425,15 @@ impl Work {
                 self.follow_hold = None;
             }
             if playing && self.follow && !holding {
+                // Scroll continuously with the playhead about a quarter of the way in, eased by
+                // frame time so it's equally smooth at 60, 144 or 240 Hz. Far jumps snap.
                 let span = grid_w as f64 / self.project.zoom as f64;
-                if pos > self.view_start + span * 0.85 || pos < self.view_start {
-                    self.view_start = pos - span * 0.15;
+                let target = pos - span * 0.25;
+                if pos < self.view_start || pos > self.view_start + span {
+                    self.view_start = target;
+                } else {
+                    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1) as f64;
+                    self.view_start += (target - self.view_start) * (1.0 - (-dt * 8.0).exp());
                 }
             }
 
@@ -1468,10 +1491,10 @@ impl Work {
             if self.project.content.tracks.is_empty() {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No tracks yet").size(18.0).strong());
-                    ui.label(egui::RichText::new("A track is one hitsound sample. Add one, then click the grid to place hits.").color(pal.text_weak));
+                    ui.label(egui::RichText::new("No samples yet").size(18.0).strong());
+                    ui.label(egui::RichText::new("Add a sample, pick its sound file, then click its row to place hits.").color(pal.text_weak));
                     ui.add_space(10.0);
-                    if icons::primary(ui, &pal, Icon::Plus, "Add track").clicked() {
+                    if icons::primary(ui, &pal, Icon::Plus, "Add sample").clicked() {
                         self.add_track(engine);
                     }
                     if self.library.is_empty() {
@@ -1486,7 +1509,8 @@ impl Work {
                 let mut rects = Vec::with_capacity(count);
                 for ti in 0..count {
                     let id = self.project.content.tracks[ti].id;
-                    let (header, rect, resp) = lane_row(ui, ("track", id), ROW_H, timeline_left, lane_right);
+                    let row_h = if self.project.compact_tracks { ROW_H_COMPACT } else { ROW_H };
+                    let (header, rect, resp) = lane_row(ui, ("track", id), row_h, timeline_left, lane_right);
                     {
                         let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
                         ui.shrink_clip_rect(header);
@@ -1499,7 +1523,7 @@ impl Work {
                 self.row_rects = rects;
                 if count > 0 {
                     ui.add_space(4.0);
-                    if ui.add(egui::Button::new(egui::RichText::new("+  Add track").color(pal.text_weak)).frame(false)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("+  Add sample").color(pal.text_weak)).frame(false)).clicked() {
                         self.add_track(engine);
                     }
                 }
@@ -1511,7 +1535,7 @@ impl Work {
             let name = ti.and_then(|i| self.project.content.tracks.get(i)).map(|t| t.name.clone()).unwrap_or_default();
             let mut close = false;
             egui::Modal::new(egui::Id::unique("confirm-remove")).show(&ctx, |ui| {
-                ui.heading("Remove track?");
+                ui.heading("Remove sample?");
                 ui.label(format!("\"{name}\" and all its hits will be removed. You can undo this."));
                 ui.horizontal(|ui| {
                     if ui.button("Remove").clicked() {
@@ -1619,7 +1643,7 @@ impl Work {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("confirm-clear")).show(&ctx, |ui| {
                 ui.heading("Remove all hits?");
-                ui.label("Every hit on every track will be removed. Tracks and volume points stay. You can undo this.");
+                ui.label("Every hit will be removed. Samples and volume points stay. You can undo this.");
                 ui.horizontal(|ui| {
                     if ui.button("Remove all").clicked() {
                         self.checkpoint();
@@ -1644,7 +1668,7 @@ impl Work {
             let mut open = true;
             egui::Window::new("Export hitsound difficulty").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
                 ui.label("Writes a new difficulty plus generated samples into the mapset folder.");
-                ui.label(egui::RichText::new("Mute and solo only affect playback here; every track is exported.").size(12.0).color(self.pal.text_weak));
+                ui.label(egui::RichText::new("Mute and solo only affect playback here; every sample is exported.").size(12.0).color(self.pal.text_weak));
                 ui.label(egui::RichText::new(self.project.mapset_dir.display().to_string()).small().weak());
                 ui.add_space(6.0);
                 egui::Grid::new("export-grid").num_columns(2).show(ui, |ui| {
@@ -1669,7 +1693,7 @@ impl Work {
                                 r.osu_file, r.circles, r.sample_files, r.first_index, r.last_index
                             );
                             if r.clipped > 0 {
-                                msg.push_str(&format!(" {} mixed samples clip; lower some track volumes.", r.clipped));
+                                msg.push_str(&format!(" {} mixed sounds clip; lower some sample volumes.", r.clipped));
                             }
                             Ok(msg)
                         }
@@ -1736,14 +1760,15 @@ impl Work {
         let color = pal.tracks[t.color as usize % 8];
 
         // Card background and colour bar that pulses when this track plays a hit.
-        let card = full.shrink2(vec2(0.0, 2.0));
-        ui.painter().rect_filled(card, CornerRadius::same(8), pal.panel);
+        let compact = self.project.compact_tracks;
+        let card = full.shrink2(vec2(0.0, if compact { 1.0 } else { 2.0 }));
+        ui.painter().rect_filled(card, CornerRadius::same(if compact { 6 } else { 8 }), pal.panel);
         let last_played = t.notes.partition_point(|&n| (n as f64) <= pos);
         let lit = playing && last_played > 0 && pos - (t.notes[last_played - 1] as f64) < 120.0;
         let bar = Rect::from_min_size(card.min, vec2(if lit { 7.0 } else { 4.0 }, card.height()));
         ui.painter().rect_filled(bar, CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, if lit { color.lerp_to_gamma(Color32::WHITE, 0.35) } else { color });
 
-        let inner = card.shrink2(vec2(12.0, 5.0)).translate(vec2(4.0, 0.0));
+        let inner = card.shrink2(vec2(12.0, if compact { 1.0 } else { 5.0 })).translate(vec2(4.0, 0.0));
         let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)));
         ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
         let mut commit_rename = None;
@@ -1764,10 +1789,14 @@ impl Work {
                 }
                 _ => {
                     let name = egui::Label::new(egui::RichText::new(&t.name).size(13.5).strong()).truncate().sense(Sense::click());
+                    let tip = match (&t.sample, compact) {
+                        (Some(s), true) => format!("Sample: {} · double-click to rename (turn off Compact to change the sound file)", s.file),
+                        _ => "Double-click to rename".to_string(),
+                    };
                     let r = ui.scope(|ui| {
-                        ui.set_max_width(130.0);
+                        ui.set_max_width(if compact { 118.0 } else { 130.0 });
                         ui.add(name)
-                    }).inner.on_hover_text("Double-click to rename");
+                    }).inner.on_hover_text(tip);
                     if r.double_clicked() {
                         commit_rename = Some(Some(format!("\u{0}{}", t.name)));
                     }
@@ -1775,10 +1804,13 @@ impl Work {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                if icons::button(ui, &pal, Icon::Trash, "Remove track", false, true).clicked() {
+                if compact && key_badge(ui, &pal, eff_key.as_deref(), t.key.is_none(), capturing == Some(t.id)).clicked() {
+                    start_capture = true;
+                }
+                if icons::button(ui, &pal, Icon::Trash, "Remove sample", false, true).clicked() {
                     remove = true;
                 }
-                if icons::button(ui, &pal, Icon::Play, "Preview sample", false, t.sample.is_some()).clicked() {
+                if icons::button(ui, &pal, Icon::Play, "Preview the sound", false, t.sample.is_some()).clicked() {
                     audition = t.sample.clone().map(|s| (s, t.volume));
                 }
                 if icons::button(ui, &pal, Icon::Headphones, "Solo", t.solo, true).clicked() {
@@ -1793,69 +1825,71 @@ impl Work {
                 }
             });
         });
-        // Second row in fixed columns, laid out from the right edge: key cap (under the
-        // trash icon), volume %, volume slider, then the sample picker fills the rest.
-        // That keeps every track's controls lined up whatever the sample name is.
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if key_badge(ui, &pal, eff_key.as_deref(), t.key.is_none(), capturing == Some(t.id)).clicked() {
-                start_capture = true;
-            }
-            ui.add_sized(vec2(32.0, 20.0), egui::Label::new(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak)));
-            ui.spacing_mut().slider_width = 52.0;
-            // One undo step per gesture: remember the volume when the press starts,
-            // compare when it's released.
-            let vol_id = egui::Id::unique(("vol-gesture-start", t.id));
-            let vol_at_start = t.volume;
-            let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Track volume");
-            let held = r.is_pointer_button_down_on() || r.dragged();
-            let started: Option<u8> = ui.data(|d| d.get_temp(vol_id));
-            if held && started.is_none() {
-                ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
-            }
-            if r.changed() {
-                live_volume = true; // hear it while dragging
-            }
-            if !held {
-                if let Some(start) = started {
-                    ui.data_mut(|d| d.remove::<u8>(vol_id));
-                    if start != t.volume {
-                        volume_before = start;
+        if !compact {
+            // Second row in fixed columns, laid out from the right edge: key cap (under the
+            // trash icon), volume %, volume slider, then the sample picker fills the rest.
+            // That keeps every track's controls lined up whatever the sample name is.
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if key_badge(ui, &pal, eff_key.as_deref(), t.key.is_none(), capturing == Some(t.id)).clicked() {
+                    start_capture = true;
+                }
+                ui.add_sized(vec2(32.0, 20.0), egui::Label::new(egui::RichText::new(format!("{}%", t.volume)).size(12.0).color(pal.text_weak)));
+                ui.spacing_mut().slider_width = 52.0;
+                // One undo step per gesture: remember the volume when the press starts,
+                // compare when it's released.
+                let vol_id = egui::Id::unique(("vol-gesture-start", t.id));
+                let vol_at_start = t.volume;
+                let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Sample volume");
+                let held = r.is_pointer_button_down_on() || r.dragged();
+                let started: Option<u8> = ui.data(|d| d.get_temp(vol_id));
+                if held && started.is_none() {
+                    ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
+                }
+                if r.changed() {
+                    live_volume = true; // hear it while dragging
+                }
+                if !held {
+                    if let Some(start) = started {
+                        ui.data_mut(|d| d.remove::<u8>(vol_id));
+                        if start != t.volume {
+                            volume_before = start;
+                            edited = true;
+                            settings_changed = true;
+                        }
+                    } else if r.changed() {
+                        // Keyboard change on the focused slider.
                         edited = true;
                         settings_changed = true;
                     }
-                } else if r.changed() {
-                    // Keyboard change on the focused slider.
-                    edited = true;
-                    settings_changed = true;
                 }
-            }
-            let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sample".into());
-            let width = ui.available_width();
-            egui::ComboBox::from_id_salt(("sample", t.id))
-                .width(width)
-                .truncate()
-                .selected_text(egui::RichText::new(label).size(12.5))
-                .show_ui(ui, |ui| {
-                    let mut last = None;
-                    for e in library.iter() {
-                        if last != Some(e.r.source) {
-                            ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
-                            last = Some(e.r.source);
-                        }
-                        let sel = t.sample.as_ref() == Some(&e.r);
-                        if ui.selectable_label(sel, &e.r.file).clicked() {
-                            retry_sample = Some(e.path.clone());
-                            if !sel {
-                                t.sample = Some(e.r.clone());
-                                settings_changed = true;
+                let label = t.sample.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| "Choose a sound file".into());
+                let width = ui.available_width();
+                egui::ComboBox::from_id_salt(("sample", t.id))
+                    .width(width)
+                    .truncate()
+                    .selected_text(egui::RichText::new(label).size(12.5))
+                    .show_ui(ui, |ui| {
+                        let mut last = None;
+                        for e in library.iter() {
+                            if last != Some(e.r.source) {
+                                ui.label(egui::RichText::new(e.r.source.label()).size(11.0).color(pal.text_weak));
+                                last = Some(e.r.source);
                             }
-                            edited = true;
-                            audition = Some((e.r.clone(), t.volume));
+                            let sel = t.sample.as_ref() == Some(&e.r);
+                            if ui.selectable_label(sel, &e.r.file).clicked() {
+                                retry_sample = Some(e.path.clone());
+                                if !sel {
+                                    t.sample = Some(e.r.clone());
+                                    settings_changed = true;
+                                }
+                                edited = true;
+                                audition = Some((e.r.clone(), t.volume));
+                            }
                         }
-                    }
-                });
-        });
+                    });
+            });
+        }
         match commit_rename {
             Some(Some(b)) if b.starts_with('\u{0}') => {
                 let id = t.id;
@@ -2409,7 +2443,7 @@ impl Work {
         }
         if resp.hovered() && self.drag.is_none() && self.project.content.tracks[ti].sample.is_none() {
             let hint = if self.project.content.tracks[ti].sample.is_none() {
-                "Pick a sample for this track first"
+                "Pick a sound file for this sample first"
             } else if self.tool == Tool::Place {
                 "Click: add · drag empty space: select · drag a hit: move · right-click: delete"
             } else {
@@ -2446,7 +2480,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("Editing", &[
         ("1 / 2", "Select tool / Place tool"),
-        ("Track keys", "Toggle a hit at the playhead (default Q / W / E / R; click a track's key cap to change)"),
+        ("Sample keys", "Toggle a hit at the playhead (default Q / W / E / R; click a sample's key cap to change)"),
         ("Ctrl+A", "Select all hits"),
         ("Ctrl+X / C / V", "Cut / copy / paste at the playhead"),
         ("Ctrl+D", "Clone selection one measure later"),
@@ -3024,7 +3058,7 @@ fn key_badge(ui: &mut egui::Ui, pal: &Palette, key: Option<&str>, is_default: bo
     painter.rect_stroke(rect, CornerRadius::same(5), stroke, StrokeKind::Inside);
     painter.text(rect.center(), Align2::CENTER_CENTER, label, FontId::monospace(12.0), text);
     let tip = if capturing {
-        "Press a key for this track · Backspace: no key · Esc: cancel".to_string()
+        "Press a key for this sample · Backspace: no key · Esc: cancel".to_string()
     } else {
         match (key, is_default) {
             (Some(k), true) => format!("Key {k} toggles a hit at the playhead (default). Click to change."),

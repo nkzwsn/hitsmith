@@ -112,6 +112,9 @@ pub struct Project {
     pub next_id: u64,
     #[serde(default)]
     pub bookmarks: Vec<i64>,
+    /// Show tracks as slim one-line rows.
+    #[serde(default)]
+    pub compact_tracks: bool,
 }
 
 fn default_zoom() -> f32 {
@@ -133,6 +136,7 @@ impl Project {
             divisor: default_div(),
             next_id: 1,
             bookmarks: Vec::new(),
+            compact_tracks: false,
         }
     }
 

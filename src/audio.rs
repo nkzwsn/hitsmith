@@ -203,6 +203,16 @@ struct Shared {
     pos: AtomicU64,
     target: AtomicU64,
     playing: AtomicBool,
+    /// Head velocity (frames per output frame) and when `pos` was published, so the UI
+    /// can predict the position between audio buffers (smooth on high-refresh screens).
+    vel: AtomicU64,
+    published_ns: AtomicU64,
+}
+
+/// Monotonic nanoseconds since the first call (shared clock for the audio and UI threads).
+fn now_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
 
 impl Shared {
@@ -210,6 +220,9 @@ impl Shared {
         self.pos.store(m.pos.to_bits(), Ordering::Relaxed);
         self.target.store(m.target.or(m.pending_jump).unwrap_or(f64::NAN).to_bits(), Ordering::Relaxed);
         self.playing.store(m.playing, Ordering::Relaxed);
+        let vel = if m.playing || m.target.is_some() { m.vel } else { 0.0 };
+        self.vel.store(vel.to_bits(), Ordering::Relaxed);
+        self.published_ns.store(now_ns(), Ordering::Relaxed);
     }
 }
 
@@ -342,7 +355,12 @@ impl Engine {
     }
     /// Where the head is right now (moves smoothly while scrubbing).
     pub fn position_ms(&self) -> f64 {
-        f64::from_bits(self.shared.pos.load(Ordering::Relaxed)) * 1000.0 / self.rate as f64
+        let pos = f64::from_bits(self.shared.pos.load(Ordering::Relaxed));
+        let vel = f64::from_bits(self.shared.vel.load(Ordering::Relaxed));
+        // The audio thread publishes once per buffer (~10 ms); in between, extrapolate so the
+        // playhead moves every frame on 120/144/240 Hz screens. Capped so a stalled stream can't run away.
+        let dt = (now_ns().saturating_sub(self.shared.published_ns.load(Ordering::Relaxed)) as f64 / 1e9).min(0.05);
+        (pos + vel * dt * self.rate as f64) * 1000.0 / self.rate as f64
     }
     /// Where the head is heading: the scrub target if any, else the position.
     /// Stepping by ticks counts from here, so quick notches add up.
