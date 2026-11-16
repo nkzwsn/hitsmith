@@ -141,20 +141,9 @@ fn theme_menu(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
     changed
 }
 
-struct Picked {
-    dir: PathBuf,
-    osu_file: String,
-    diffs: Vec<String>,
-    meta: Meta,
-    bpm: String,
-    bg: Option<egui::TextureHandle>,
-}
-
 #[derive(Default)]
 struct Home {
     projects: Vec<ProjectEntry>,
-    picked: Option<Picked>,
-    name: String,
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
     /// Card thumbnails, loaded a few per frame so the list appears instantly.
@@ -265,49 +254,90 @@ impl App {
         self.home.projects = project::list_projects(&self.projects_dir);
     }
 
+    /// The osu! Songs folder, used as the place to unpack .osz files.
+    fn songs_dir(&self) -> PathBuf {
+        let is_songs = |d: &Path| d.is_dir() && d.parent().is_some_and(|p| p.join("osu!.exe").is_file());
+        library::guess_songs_dir()
+            .filter(|d| is_songs(d))
+            .or_else(|| self.settings.last_dir.clone().filter(|d| is_songs(d)))
+            .unwrap_or_else(|| self.data_dir.join("mapsets"))
+    }
+
     fn pick_beatmap(&mut self, ctx: &egui::Context) {
         let start = self.settings.last_dir.clone().filter(|d| d.is_dir()).or_else(library::guess_songs_dir);
-        let mut dialog = rfd::FileDialog::new().set_title("Open an osu! beatmap (.osu)").add_filter("osu! beatmap", &["osu"]);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open a mapset (.osz) or a difficulty (.osu)")
+            .add_filter("osu! mapset or difficulty", &["osz", "osu"]);
         if let Some(dir) = start {
             dialog = dialog.set_directory(dir);
         }
         let Some(file) = dialog.pick_file() else { return };
-        self.select_beatmap(ctx, &file);
+        self.start_from_path(ctx, &file);
     }
 
-    fn select_beatmap(&mut self, ctx: &egui::Context, file: &Path) {
+    /// Start a project from a dropped or picked .osz, mapset folder or .osu,
+    /// with starter hitsound tracks, and open it straight away.
+    fn start_from_path(&mut self, ctx: &egui::Context, path: &Path) {
         self.home.error = None;
-        let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else { return };
-        match osu::read_beatmap(file) {
-            Ok(bm) => {
-                let mut diffs: Vec<String> = std::fs::read_dir(dir)
-                    .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.to_ascii_lowercase().ends_with(".osu")).collect())
-                    .unwrap_or_default();
-                diffs.sort();
-                let bpms: Vec<f64> = bm.red_lines.iter().map(RedLine::bpm).collect();
-                let (lo, hi) = bpms.iter().fold((f64::MAX, f64::MIN), |(a, b), &v| (a.min(v), b.max(v)));
-                let bpm = if (hi - lo).abs() < 0.01 { format!("{lo:.0} BPM") } else { format!("{lo:.0}-{hi:.0} BPM") };
-                let bg = load_background(ctx, &dir.join(&bm.meta.background));
-                if self.home.name.trim().is_empty() {
-                    // Suggest a name that isn't taken yet: "Title", "Title (2)", ...
-                    let base = osu::sanitize_file_part(bm.meta.title.as_str());
-                    let base = if base.is_empty() { "New project".to_string() } else { base };
-                    let mut name = base.clone();
-                    let mut n = 2;
-                    while self.projects_dir.join(&name).exists() {
-                        name = format!("{base} ({n})");
-                        n += 1;
-                    }
-                    self.home.name = name;
-                }
-                if let Some(songs) = dir.parent() {
-                    self.settings.last_dir = Some(songs.to_path_buf());
-                    self.save_settings();
-                }
-                self.home.picked = Some(Picked { dir: dir.to_path_buf(), osu_file: name.to_string_lossy().into_owned(), diffs, meta: bm.meta, bpm, bg });
+        let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let result = (|| -> anyhow::Result<(PathBuf, Option<String>)> {
+            if path.is_dir() {
+                Ok((path.to_path_buf(), None))
+            } else if ext == "osz" {
+                let songs = self.songs_dir();
+                std::fs::create_dir_all(&songs)?;
+                Ok((project::import_osz(path, &songs)?, None))
+            } else if ext == "osu" {
+                let dir = path.parent().ok_or_else(|| anyhow::anyhow!("bad path"))?.to_path_buf();
+                Ok((dir, path.file_name().map(|n| n.to_string_lossy().into_owned())))
+            } else {
+                anyhow::bail!("Drop a mapset (.osz), a mapset folder, or a difficulty (.osu).")
             }
+        })();
+        match result.and_then(|(dir, osu)| self.quick_create(ctx, &dir, osu)) {
+            Ok(()) => {}
             Err(e) => self.home.error = Some(format!("{e:#}")),
         }
+    }
+
+    fn quick_create(&mut self, ctx: &egui::Context, dir: &Path, osu_file: Option<String>) -> anyhow::Result<()> {
+        let osu_file = match osu_file {
+            Some(f) => f,
+            None => {
+                let mut diffs: Vec<String> = std::fs::read_dir(dir)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.to_ascii_lowercase().ends_with(".osu"))
+                    .collect();
+                diffs.sort();
+                diffs.into_iter().next().ok_or_else(|| anyhow::anyhow!("No difficulty (.osu) found in {}", dir.display()))?
+            }
+        };
+        let bm = osu::read_beatmap(&dir.join(&osu_file))?;
+        // A free project name: "Title", "Title (2)", ...
+        let base = osu::sanitize_file_part(bm.meta.title.as_str());
+        let base = if base.is_empty() { "New project".to_string() } else { base };
+        let mut name = base.clone();
+        let mut n = 2;
+        while self.projects_dir.join(&name).exists() {
+            name = format!("{base} ({n})");
+            n += 1;
+        }
+        let mut proj = Project::new(dir.to_path_buf(), osu_file);
+        proj.bookmarks = bm.bookmarks;
+        // Starter tracks from the mapset's own hitsounds (or the skin's).
+        let exported = export::read_manifest(dir).all_files();
+        let lib = project::sample_library(&self.projects_dir.join(&name).join("samples"), dir, &bm.meta.audio_filename, library::current_skin_dir(dir).as_deref(), &exported);
+        proj.content.tracks = project::default_tracks(&lib);
+        proj.next_id = proj.content.tracks.len() as u64 + 1;
+        let entry = project::create(&self.projects_dir, &name, &proj)?;
+        if let Some(songs) = dir.parent() {
+            self.settings.last_dir = Some(songs.to_path_buf());
+            self.save_settings();
+        }
+        self.refresh_projects();
+        self.open_project(ctx, entry);
+        Ok(())
     }
 
     fn open_project(&mut self, ctx: &egui::Context, entry: ProjectEntry) {
@@ -324,12 +354,13 @@ impl App {
         let ctx = ui.ctx().clone();
         let pal = self.pal;
 
-        // Drag a .osu file anywhere onto the window to start a project.
+        // Drop a .osz, a mapset folder or a .osu anywhere on the window to start a project.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if let Some(f) = dropped.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("osu"))) {
-            self.select_beatmap(&ctx, f);
-        } else if !dropped.is_empty() {
-            self.home.error = Some("Drop a .osu file (any difficulty of the mapset).".into());
+        if let Some(f) = dropped.first() {
+            self.start_from_path(&ctx, f);
+            if !matches!(self.screen, Screen::Home) {
+                return;
+            }
         }
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
@@ -428,79 +459,7 @@ impl App {
             painter.rect_filled(screen, 0.0, pal.bg.gamma_multiply(0.85));
             let r = screen.shrink(40.0);
             painter.rect_stroke(r, CornerRadius::same(18), Stroke::new(2.0, pal.accent), StrokeKind::Inside);
-            painter.text(r.center(), Align2::CENTER_CENTER, "Drop a .osu file to start a project", FontId::proportional(22.0), pal.text);
-        }
-
-        // New-project dialog: one step from a picked beatmap to a project.
-        if self.home.picked.is_some() {
-            let mut close = false;
-            let mut create = false;
-            let mut switch_to = None;
-            egui::Modal::new(egui::Id::unique("new-project")).show(&ctx, |ui| {
-                let p = self.home.picked.as_ref().unwrap();
-                ui.set_width(520.0);
-                if let Some(tex) = &p.bg {
-                    let (rect, _) = ui.allocate_exact_size(vec2(520.0, 150.0), Sense::hover());
-                    paint_cover(ui, rect, tex, CornerRadius::same(10));
-                }
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(p.meta.display_title()).size(20.0).strong());
-                ui.label(egui::RichText::new(format!("{}  ·  mapped by {}  ·  {}", p.meta.display_artist(), p.meta.creator, p.bpm)).color(pal.text_weak));
-                ui.add_space(10.0);
-                egui::Grid::new("new-project-grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-                    ui.label("Timing from");
-                    egui::ComboBox::from_id_salt("diff").width(380.0).selected_text(&p.osu_file).show_ui(ui, |ui| {
-                        for d in &p.diffs {
-                            if ui.selectable_label(*d == p.osu_file, d).clicked() {
-                                switch_to = Some(p.dir.join(d));
-                            }
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Project name");
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.home.name).desired_width(380.0));
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        create = true;
-                    }
-                    ui.end_row();
-                });
-                if let Some(err) = &self.home.error {
-                    ui.colored_label(pal.danger, err);
-                }
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if icons::primary(ui, &pal, Icon::Plus, "Create project").clicked() {
-                        create = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
-            });
-            if let Some(f) = switch_to {
-                self.select_beatmap(&ctx, &f);
-            }
-            if create {
-                let p = self.home.picked.as_ref().unwrap();
-                let mut proj = Project::new(p.dir.clone(), p.osu_file.clone());
-                if let Ok(bm) = osu::read_beatmap(&p.dir.join(&p.osu_file)) {
-                    proj.bookmarks = bm.bookmarks;
-                }
-                match project::create(&self.projects_dir, &self.home.name, &proj) {
-                    Ok(entry) => {
-                        self.home.name.clear();
-                        self.home.picked = None;
-                        self.home.error = None;
-                        self.refresh_projects();
-                        self.open_project(&ctx, entry);
-                    }
-                    Err(e) => self.home.error = Some(format!("{e:#}")),
-                }
-            } else if close || ui.input(|i| i.key_pressed(Key::Escape)) {
-                self.home.picked = None;
-                self.home.name.clear();
-                self.home.error = None;
-            }
+            painter.text(r.center(), Align2::CENTER_CENTER, "Drop a .osz, mapset folder or .osu to start a project", FontId::proportional(22.0), pal.text);
         }
 
         if let Some(dir) = self.home.confirm_delete.clone() {
@@ -535,9 +494,7 @@ impl App {
 
 /// The "Getting started" guide on the home screen. Returns true when dismissed.
 fn guide_panel(ui: &mut egui::Ui, pal: &Palette) -> bool {
-    const STEPS: [(Icon, &str, &str); 5] = [
-        (Icon::Plus, "Open a beatmap", "Click New project and pick any difficulty (.osu) of the mapset, or drop a .osu on the window."),
-        (Icon::Music, "Add tracks", "Each track is one hitsound sample. Pick it from the mapset, your skin, or import your own."),
+    const STEPS: [(Icon, &str, &str); 3] = [
         (Icon::Pencil, "Place hits", "Click the grid to place a hit, or press a track's key (Q W E R) at the playhead."),
         (Icon::Speaker, "Shape the volume", "Click the Volume lane to add a point, then drag it up or down."),
         (Icon::Export, "Export", "Writes a hitsound difficulty and its samples into the mapset folder, ready for osu!."),
@@ -553,7 +510,7 @@ fn guide_panel(ui: &mut egui::Ui, pal: &Palette) -> bool {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("Getting started").size(18.0).strong());
-                    ui.label(egui::RichText::new("Make a hitsound difficulty in five steps.").color(pal.text_weak));
+                    ui.label(egui::RichText::new("Drop a mapset (.osz) or its folder anywhere on this window, or click New project. hitsmith sets up the project and Normal / Whistle / Finish / Clap tracks for you. Then:").color(pal.text_weak));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Got it").on_hover_text("Hide this guide (the Guide button brings it back)").clicked() {
@@ -633,7 +590,7 @@ fn new_project_card(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
     painter.circle_filled(c, 26.0, pal.accent);
     icons::paint(painter, Rect::from_center_size(c, Vec2::splat(24.0)), Icon::Plus, pal.bg);
     painter.text(c + vec2(0.0, 46.0), Align2::CENTER_CENTER, "New project", FontId::proportional(16.0), pal.text);
-    painter.text(c + vec2(0.0, 68.0), Align2::CENTER_CENTER, "Open a .osu, or drop one here", FontId::proportional(12.0), pal.text_weak);
+    painter.text(c + vec2(0.0, 68.0), Align2::CENTER_CENTER, "Open or drop a .osz, folder or .osu", FontId::proportional(12.0), pal.text_weak);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

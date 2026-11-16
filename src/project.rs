@@ -474,3 +474,140 @@ mod key_match_tests {
         assert_eq!(k[1].as_deref(), Some("Q"));
     }
 }
+
+/// Unzip an .osz (a zipped mapset) into `songs_dir/<name>`, like osu! does on import.
+/// If that folder already holds a mapset, it is reused instead of overwritten.
+pub fn import_osz(osz: &Path, songs_dir: &Path) -> Result<PathBuf> {
+    const MAX_TOTAL: u64 = 2 * 1024 * 1024 * 1024; // refuse absurd archives
+    let stem = osz.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name: String = stem.chars().filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !c.is_control()).collect();
+    let name = name.trim().trim_end_matches('.').to_string();
+    if name.is_empty() {
+        bail!("That .osz has no usable name.");
+    }
+    let target = songs_dir.join(&name);
+    let has_osu = |dir: &Path| fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".osu"))).unwrap_or(false);
+    if has_osu(&target) {
+        return Ok(target);
+    }
+    let file = fs::File::open(osz).with_context(|| format!("opening {}", osz.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("that .osz isn't a valid archive")?;
+    fs::create_dir_all(&target)?;
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        // enclosed_name rejects absolute paths and ".." so nothing lands outside the mapset folder.
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let out = target.join(rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&out)?;
+            continue;
+        }
+        total += entry.size();
+        if total > MAX_TOTAL {
+            bail!("That .osz is too large to import.");
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut f = fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut f)?;
+    }
+    if !has_osu(&target) {
+        bail!("That .osz doesn't contain any difficulty (.osu).");
+    }
+    Ok(target)
+}
+
+/// Starter tracks for a new project: Normal, Whistle, Finish and Clap, each with the
+/// best matching sample (the mapset's own first, plain "normal-" set preferred, then the skin).
+pub fn default_tracks(library: &[SampleEntry]) -> Vec<Track> {
+    const KINDS: [(&str, &str); 4] = [("Normal", "hitnormal"), ("Whistle", "hitwhistle"), ("Finish", "hitfinish"), ("Clap", "hitclap")];
+    let score = |e: &SampleEntry, kind: &str| -> Option<u32> {
+        let f = e.r.file.to_ascii_lowercase();
+        let stem = f.rsplit_once('.').map(|(a, _)| a).unwrap_or(&f);
+        let (set, rest) = stem.split_once('-')?;
+        let digits = rest.strip_prefix(kind)?;
+        if !digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let source = match e.r.source {
+            SampleSource::Mapset => 0,
+            SampleSource::Project => 1,
+            SampleSource::Skin => 2,
+        };
+        let set_rank = match set {
+            "normal" => 0,
+            "soft" => 1,
+            "drum" => 2,
+            _ => return None,
+        };
+        Some(source * 100 + set_rank * 10 + if digits.is_empty() { 0 } else { 1 })
+    };
+    KINDS
+        .iter()
+        .enumerate()
+        .map(|(i, (name, kind))| {
+            let sample = library.iter().filter_map(|e| score(e, kind).map(|s| (s, e))).min_by_key(|(s, _)| *s).map(|(_, e)| e.r.clone());
+            Track { id: i as u64 + 1, name: name.to_string(), sample, volume: 80, muted: false, solo: false, color: i as u8, notes: Vec::new(), key: None }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod quick_start_tests {
+    use super::*;
+
+    fn entry(source: SampleSource, file: &str) -> SampleEntry {
+        SampleEntry { r: SampleRef { source, file: file.into() }, path: PathBuf::from(file) }
+    }
+
+    #[test]
+    fn default_tracks_prefer_mapset_plain_normal_set() {
+        let lib = vec![
+            entry(SampleSource::Skin, "normal-hitclap.wav"),
+            entry(SampleSource::Mapset, "soft-hitclap.wav"),
+            entry(SampleSource::Mapset, "normal-hitnormal2.wav"),
+            entry(SampleSource::Mapset, "normal-hitnormal.wav"),
+            entry(SampleSource::Mapset, "soft-sliderslide.wav"),
+            entry(SampleSource::Skin, "drum-hitwhistle.wav"),
+        ];
+        let t = default_tracks(&lib);
+        let pick = |i: usize| t[i].sample.as_ref().map(|s| (s.source, s.file.clone()));
+        assert_eq!(pick(0), Some((SampleSource::Mapset, "normal-hitnormal.wav".into())));
+        assert_eq!(pick(1), Some((SampleSource::Skin, "drum-hitwhistle.wav".into())));
+        assert_eq!(pick(2), None, "no finish sample anywhere");
+        assert_eq!(pick(3), Some((SampleSource::Mapset, "soft-hitclap.wav".into())));
+        // Their default keys follow the sample kind.
+        let keys = effective_keys(&t);
+        assert_eq!(keys[0].as_deref(), Some("Q"));
+        assert_eq!(keys[3].as_deref(), Some("R"));
+    }
+
+    #[test]
+    fn osz_import_extracts_and_reuses() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("hitsmith-osz-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let osz = dir.join("123 Artist - Song.osz");
+        {
+            let mut w = zip::ZipWriter::new(fs::File::create(&osz).unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("Artist - Song (me) [Easy].osu", opts).unwrap();
+            w.write_all(b"osu file format v14").unwrap();
+            w.start_file("../evil.txt", opts).unwrap();
+            w.write_all(b"no").unwrap();
+            w.finish().unwrap();
+        }
+        let songs = dir.join("Songs");
+        fs::create_dir_all(&songs).unwrap();
+        let out = import_osz(&osz, &songs).unwrap();
+        assert_eq!(out, songs.join("123 Artist - Song"));
+        assert!(out.join("Artist - Song (me) [Easy].osu").exists());
+        assert!(!songs.join("evil.txt").exists() && !dir.join("evil.txt").exists(), "zip-slip entry must be skipped");
+        // Second import reuses the folder.
+        assert_eq!(import_osz(&osz, &songs).unwrap(), out);
+        fs::remove_dir_all(&dir).ok();
+    }
+}

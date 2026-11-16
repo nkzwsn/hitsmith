@@ -9,10 +9,11 @@ A lightweight hitsounding workstation for osu! mappers, written in Rust.
 
 ## Using it
 
-1. Click **Open beatmap...** and pick any difficulty (`.osu`) of the mapset. Its red lines give the beat grid.
-2. Name the project and click **Create project**.
-3. **+ Track**, choose a sample (from the project, the mapset, or your current osu! skin), then click the grid to place hits.
-4. Use the **Volume** lane to add volume points. **Export...** writes a hitsound difficulty into the mapset folder.
+1. Drop a mapset (`.osz`), a mapset folder, or any difficulty (`.osu`) onto the window, or click **New project**.
+   A `.osz` is unpacked into your osu! Songs folder, like osu! does. hitsmith creates the project and
+   Normal / Whistle / Finish / Clap tracks using the mapset's own hitsound samples (or your skin's).
+2. Click the grid to place hits, or press a track's key (Q/W/E/R by default) at the playhead.
+3. Use the **Volume** lane to add volume points. **Export** writes a hitsound difficulty into the mapset folder.
 
 Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the full list):
 
