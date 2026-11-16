@@ -34,11 +34,13 @@ struct Settings {
     scrub_sound: bool,
     /// Show the "Getting started" guide on the home screen.
     show_guide: bool,
+    /// Overall output volume (Alt+wheel).
+    master_volume: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0, scrub_sound: false, show_guide: true }
+        Self { last_dir: None, song_volume: 0.7, hit_volume: 1.0, dark_mode: true, dark_palette: 0, light_palette: 0, scrub_sound: false, show_guide: true, master_volume: 1.0 }
     }
 }
 
@@ -171,6 +173,9 @@ pub struct App {
     titlebar: crate::titlebar::TitleBar,
     /// Palette the window icon was last drawn in.
     icon_palette: Option<(&'static str, bool)>,
+    /// Screen change in progress: fading out of the workstation, then into the next screen.
+    leaving: Option<Instant>,
+    arriving: Option<Instant>,
 }
 
 fn data_dir() -> PathBuf {
@@ -234,6 +239,7 @@ impl App {
         let (engine, audio_error) = match Engine::new() {
             Ok(e) => {
                 e.set_gains(settings.song_volume, settings.hit_volume);
+                e.set_master(settings.master_volume);
                 e.set_scrub_sound(settings.scrub_sound);
                 (Some(e), None)
             }
@@ -241,7 +247,7 @@ impl App {
         };
         let theme = ThemeState::new(settings.palette());
         let pal = *theme.target();
-        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, titlebar: Default::default(), icon_palette: None };
+        let mut app = Self { data_dir, projects_dir, settings, engine, audio_error, screen: Screen::Home, home: Home::default(), theme, pal, theme_changed: false, titlebar: Default::default(), icon_palette: None, leaving: None, arriving: None };
         app.refresh_projects();
         app
     }
@@ -355,10 +361,19 @@ impl App {
         Ok(())
     }
 
+    /// Paint the background colour over the whole window at `alpha` (screen transitions).
+    fn cover(&self, ctx: &egui::Context, alpha: f32) {
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("screen-fade")));
+        painter.rect_filled(ctx.content_rect(), 0.0, self.pal.bg.gamma_multiply(alpha.clamp(0.0, 1.0)));
+    }
+
     fn open_project(&mut self, ctx: &egui::Context, entry: ProjectEntry) {
         match project::load(&entry.json()) {
             Ok(p) => match Work::open(ctx, entry, p, self.engine.as_ref()) {
-                Ok(w) => self.screen = Screen::Work(Box::new(w)),
+                Ok(w) => {
+                    self.screen = Screen::Work(Box::new(w));
+                    self.arriving = Some(Instant::now());
+                }
                 Err(e) => self.home.error = Some(format!("{e:#}")),
             },
             Err(e) => self.home.error = Some(format!("{e:#}")),
@@ -698,7 +713,7 @@ impl eframe::App for App {
         match &mut self.screen {
             Screen::Home => self.home_ui(ui),
             Screen::Work(w) => {
-                let mut vols = (self.settings.song_volume, self.settings.hit_volume);
+                let mut vols = (self.settings.song_volume, self.settings.hit_volume, self.settings.master_volume);
                 w.pal = self.pal;
                 w.scrub_sound = self.settings.scrub_sound;
                 let settings = &mut self.settings;
@@ -709,11 +724,13 @@ impl eframe::App for App {
                     self.settings.scrub_sound = w.scrub_sound;
                     self.save_settings();
                 }
-                if vols != (self.settings.song_volume, self.settings.hit_volume) {
+                if vols != (self.settings.song_volume, self.settings.hit_volume, self.settings.master_volume) {
                     self.settings.song_volume = vols.0;
                     self.settings.hit_volume = vols.1;
+                    self.settings.master_volume = vols.2;
                     if let Some(e) = &self.engine {
                         e.set_gains(vols.0, vols.1);
+                        e.set_master(vols.2);
                     }
                 }
             }
@@ -731,7 +748,8 @@ impl eframe::App for App {
                 }
             }
         }
-        if go_home {
+        if go_home && self.leaving.is_none() {
+            let mut closing = false;
             if let Screen::Work(w) = &mut self.screen {
                 if !w.force_leave {
                     w.save_now();
@@ -742,14 +760,43 @@ impl eframe::App for App {
                 }
                 if w.close_after_leave {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    closing = true;
                 }
             }
-            if let Some(e) = &self.engine {
-                e.stop_all();
+            if !closing {
+                // Fade the music and the screen out, then fade the projects in, instead of a hard cut.
+                if let Some(e) = &self.engine {
+                    e.play(false);
+                }
+                self.leaving = Some(Instant::now());
             }
-            self.save_settings();
-            self.screen = Screen::Home;
-            self.refresh_projects();
+        }
+        const FADE_OUT: f32 = 0.16;
+        const FADE_IN: f32 = 0.22;
+        if let Some(t) = self.leaving {
+            let k = t.elapsed().as_secs_f32() / FADE_OUT;
+            if k >= 1.0 {
+                self.leaving = None;
+                if let Some(e) = &self.engine {
+                    e.stop_all();
+                }
+                self.save_settings();
+                self.screen = Screen::Home;
+                self.refresh_projects();
+                self.arriving = Some(Instant::now());
+                self.cover(&ctx, 1.0);
+            } else {
+                self.cover(&ctx, ease(k));
+            }
+            ctx.request_repaint();
+        } else if let Some(t) = self.arriving {
+            let k = t.elapsed().as_secs_f32() / FADE_IN;
+            if k >= 1.0 {
+                self.arriving = None;
+            } else {
+                self.cover(&ctx, 1.0 - ease(k));
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -822,6 +869,10 @@ struct Work {
     clipboard: Vec<NoteKey>,
     speed: f64,
     wheel_acc: f32,
+    /// Volume lane rect from the last frame (the wheel is handled before the lane is laid out).
+    vol_lane_rect: Option<Rect>,
+    /// Point being changed with the wheel and when, so a burst of notches is one undo step.
+    vol_wheel: Option<(usize, Instant)>,
     div_acc: f32,
     /// Visible time span (ms) of the timeline, from the last frame.
     view_span: f64,
@@ -902,6 +953,8 @@ impl Work {
             clipboard: Vec::new(),
             speed: 1.0,
             wheel_acc: 0.0,
+            vol_lane_rect: None,
+            vol_wheel: None,
             div_acc: 0.0,
             view_span: 5000.0,
             row_rects: Vec::new(),
@@ -1119,7 +1172,7 @@ impl Work {
     }
 
     /// Returns true when the user wants to go back home.
-    fn ui(&mut self, ui: &mut egui::Ui, engine: Option<&Engine>, vols: &mut (f32, f32), theme_ui: &mut dyn FnMut(&mut egui::Ui)) -> bool {
+    fn ui(&mut self, ui: &mut egui::Ui, engine: Option<&Engine>, vols: &mut (f32, f32, f32), theme_ui: &mut dyn FnMut(&mut egui::Ui)) -> bool {
         let ctx = ui.ctx().clone();
         if let Some(rx) = &self.song_rx {
             if let Ok(r) = rx.try_recv() {
@@ -1315,11 +1368,13 @@ impl Work {
                         ui.label(egui::RichText::new("Zoom").size(12.0).color(pal.text_weak));
                     });
                     icons::group(ui, &pal, |ui| {
-                        ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume");
+                        let r = ui.add(egui::Slider::new(&mut vols.1, 0.0..=1.5).show_value(false)).on_hover_text("Hitsound volume (wheel: 5%)");
+                        wheel_nudge(ui, &r, &mut vols.1, 0.05, 0.0, 1.5);
                         ui.label(egui::RichText::new("Hits").size(12.0).color(pal.text_weak));
                     });
                     icons::group(ui, &pal, |ui| {
-                        ui.add(egui::Slider::new(&mut vols.0, 0.0..=1.0).show_value(false)).on_hover_text("Song volume");
+                        let r = ui.add(egui::Slider::new(&mut vols.0, 0.0..=1.0).show_value(false)).on_hover_text("Song volume (wheel: 5%)");
+                        wheel_nudge(ui, &r, &mut vols.0, 0.05, 0.0, 1.0);
                         ui.label(egui::RichText::new("Song").size(12.0).color(pal.text_weak));
                     });
                 });
@@ -1379,28 +1434,54 @@ impl Work {
             self.view_span = grid_w as f64 / self.project.zoom as f64;
             let hover = ui.input(|i| i.pointer.hover_pos());
             let over_popup = |h: Pos2| ctx.layer_id_at(h).is_some_and(|l| l.order != egui::Order::Background);
-            if let Some(h) = hover.filter(|h| full.contains(*h) && h.x > timeline_left && !over_popup(*h)) {
-                let notches: Vec<(f32, Modifiers)> = ui.input(|i| {
-                    i.events
-                        .iter()
-                        .filter_map(|e| match e {
-                            Event::MouseWheel { unit, delta, modifiers, .. } => {
-                                // Wheel up / away from you is positive y.
-                                let d = delta.y + delta.x;
-                                let n = match unit {
-                                    egui::MouseWheelUnit::Line => d,
-                                    egui::MouseWheelUnit::Point => d / 40.0,
-                                    egui::MouseWheelUnit::Page => d * 3.0,
-                                };
-                                Some((n, *modifiers))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                });
+            let on_timeline = hover.is_some_and(|h| full.contains(h) && h.x > timeline_left && !over_popup(h));
+            if !on_timeline && hover.is_some_and(|h| !over_popup(h)) {
+                // Alt+wheel anywhere else: overall volume.
+                let n: f32 = wheel_notches(ui).iter().filter(|(_, m)| m.alt).map(|(n, _)| n).sum();
+                if n != 0.0 {
+                    vols.2 = (((vols.2 + n * 0.05) * 20.0).round() / 20.0).clamp(0.0, 1.5);
+                    self.toast(format!("Volume {:.0}%", vols.2 * 100.0));
+                    ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+                }
+            }
+            // A burst of wheel notches on a volume point ends after a short pause.
+            if self.vol_wheel.is_some_and(|(_, t)| t.elapsed() > Duration::from_millis(700)) {
+                self.vol_wheel = None;
+            }
+            if let Some(h) = hover.filter(|_| on_timeline) {
+                let notches = wheel_notches(ui);
                 let tr = Rect::from_min_size(pos2(timeline_left, full.top()), vec2(grid_w, full.height()));
+                // Over a volume point, the plain wheel changes its volume instead of seeking.
+                let vol_point = self.vol_lane_rect.filter(|r| r.contains(h) && self.drag.is_none()).and_then(|r| {
+                    self.project
+                        .content
+                        .control_points
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (i, (self.x_of(r, c.time as f64) - h.x).abs()))
+                        .filter(|&(_, d)| d < 9.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(i, _)| i)
+                });
                 for (n, m) in notches {
-                    if m.command {
+                    if let (Some(i), false, false) = (vol_point, m.command, m.alt) {
+                        self.wheel_acc += n;
+                        while self.wheel_acc.abs() >= 1.0 {
+                            let up = self.wheel_acc > 0.0;
+                            self.wheel_acc -= 1.0f32.copysign(self.wheel_acc);
+                            let step: i32 = if m.shift { 1 } else { 5 };
+                            let old = self.project.content.control_points[i].volume;
+                            let new = (old as i32 + if up { step } else { -step }).clamp(5, 100) as u8;
+                            if new != old {
+                                if self.vol_wheel.map(|(j, _)| j) != Some(i) {
+                                    self.checkpoint();
+                                }
+                                self.vol_wheel = Some((i, Instant::now()));
+                                self.project.content.control_points[i].volume = new;
+                                self.changed(engine);
+                            }
+                        }
+                    } else if m.command {
                         // Wheel up = finer snap (1/4 -> 1/6), down = coarser.
                         self.div_acc += n;
                         while self.div_acc.abs() >= 1.0 {
@@ -1454,7 +1535,7 @@ impl Work {
                 let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(header));
                 ui.shrink_clip_rect(header);
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("Song").size(13.0).strong());
+                ui.label(egui::RichText::new("Difficulty").size(13.0).strong());
                 // Which difficulty provides the timing (and the template for export).
                 let current = self.project.osu_file.clone();
                 let shown = current.rsplit_once('[').map(|(_, v)| v.trim_end_matches(".osu").trim_end_matches(']').to_string()).unwrap_or_else(|| current.clone());
@@ -1462,7 +1543,7 @@ impl Work {
                 egui::ComboBox::from_id_salt("timing-diff")
                     .width(header.width() - 8.0)
                     .truncate()
-                    .selected_text(egui::RichText::new(format!("Timing: {shown}")).size(12.0))
+                    .selected_text(egui::RichText::new(shown).size(12.0))
                     .show_ui(ui, |ui| {
                         for d in self.diffs.iter() {
                             let label = d.rsplit_once('[').map(|(_, v)| v.trim_end_matches(".osu").trim_end_matches(']').to_string()).unwrap_or_else(|| d.clone());
@@ -1481,6 +1562,7 @@ impl Work {
 
             // Volume (control point) lane.
             let (header, rect, resp) = lane_row(ui, "volume", LANE_H, timeline_left, lane_right);
+            self.vol_lane_rect = Some(rect);
             {
                 let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(header));
                 ui.shrink_clip_rect(header);
@@ -1489,7 +1571,7 @@ impl Work {
                     ui.label(egui::RichText::new("Volume").size(13.0).strong());
                     ui.label(egui::RichText::new(format!("{}%", self.project.volume_at(pos as i64))).size(13.0).color(pal.accent));
                 });
-                ui.label(egui::RichText::new("Click to add a point, drag to change it").size(11.5).color(pal.text_weak));
+                ui.label(egui::RichText::new("Click to add a point, drag or wheel to change it").size(11.5).color(pal.text_weak));
             }
             self.volume_lane(ui, rect, &resp, pos, engine);
             ui.add_space(6.0);
@@ -1676,6 +1758,35 @@ impl Work {
             egui::Window::new("Export hitsound difficulty").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
                 ui.label("Writes a new difficulty plus generated samples into the mapset folder.");
                 ui.label(egui::RichText::new("Mute and solo only affect playback here; every sample is exported.").size(12.0).color(self.pal.text_weak));
+                const MODES: [&str; 4] = ["osu!standard", "osu!taiko", "osu!catch", "osu!mania"];
+                let source_mode = (self.meta.mode as usize).min(3);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Game mode");
+                    let current = match self.project.export.mode {
+                        None => format!("Same as timing difficulty ({})", MODES[source_mode]),
+                        Some(m) => MODES[(m as usize).min(3)].to_string(),
+                    };
+                    egui::ComboBox::from_id_salt("export-mode").width(260.0).selected_text(current).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.project.export.mode.is_none(), format!("Same as timing difficulty ({})", MODES[source_mode])).clicked() {
+                            self.project.export.mode = None;
+                            self.dirty = true;
+                        }
+                        for (i, name) in MODES.iter().enumerate() {
+                            if ui.selectable_label(self.project.export.mode == Some(i as u8), *name).clicked() {
+                                self.project.export.mode = Some(i as u8);
+                                self.dirty = true;
+                            }
+                        }
+                    });
+                });
+                let note = match self.project.export.mode.map(|m| m as usize).unwrap_or(source_mode) {
+                    0 => "A normal hitsound difficulty: circles that play your sounds. Works for copying hitsounds to any mode.",
+                    1 => "In taiko, whistle/clap/finish change note types, so the export is all dons that play your sounds.",
+                    2 => "Catch uses the same hitsounds as standard: fruits that play your sounds.",
+                    _ => "osu!mania, keysounded: every sound is its own note naming its file; the key count is the most sounds that play at once (up to 10).",
+                };
+                ui.label(egui::RichText::new(note).size(12.0).color(self.pal.text_weak));
                 ui.label(egui::RichText::new(self.project.mapset_dir.display().to_string()).small().weak());
                 ui.add_space(6.0);
                 egui::Grid::new("export-grid").num_columns(2).show(ui, |ui| {
@@ -1694,6 +1805,13 @@ impl Work {
                 if ui.button("Export").clicked() {
                     self.save_now();
                     self.export_result = Some(match export::export(&self.project, &self.library) {
+                        Ok(r) if r.keys.is_some() => Ok(format!(
+                            "Wrote \"{}\": {} keysounded notes on {} keys ({} sound files copied in).",
+                            r.osu_file,
+                            r.circles,
+                            r.keys.unwrap_or(0),
+                            r.sample_files
+                        )),
                         Ok(r) => {
                             let mut msg = format!(
                                 "Wrote \"{}\": {} circles, {} sample files (normal-hitnormal{}..{}).",
@@ -1847,8 +1965,27 @@ impl Work {
                 // compare when it's released.
                 let vol_id = egui::Id::unique(("vol-gesture-start", t.id));
                 let vol_at_start = t.volume;
-                let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Sample volume");
-                let held = r.is_pointer_button_down_on() || r.dragged();
+                let r = ui.add(egui::Slider::new(&mut t.volume, 0..=100).show_value(false)).on_hover_text("Sample volume (wheel: 5%)");
+                // The wheel nudges 5%; a burst of notches counts as one gesture (held until it pauses).
+                let wheel_id = egui::Id::unique(("vol-wheel-at", t.id));
+                let mut wheeled = false;
+                if r.hovered() {
+                    let n: f32 = wheel_notches(ui).iter().filter(|(_, m)| !m.alt && !m.command).map(|(n, _)| n).sum();
+                    ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+                    if n != 0.0 {
+                        let v = ((t.volume as f32 + n * 5.0) / 5.0).round() * 5.0;
+                        t.volume = v.clamp(0.0, 100.0) as u8;
+                        live_volume = true;
+                        wheeled = true;
+                        ui.data_mut(|d| d.insert_temp(wheel_id, ui.input(|i| i.time)));
+                        ui.ctx().request_repaint_after(Duration::from_millis(700));
+                    }
+                }
+                let wheel_burst = ui.data(|d| d.get_temp::<f64>(wheel_id)).is_some_and(|at| ui.input(|i| i.time) - at < 0.6);
+                if !wheel_burst {
+                    ui.data_mut(|d| d.remove::<f64>(wheel_id));
+                }
+                let held = r.is_pointer_button_down_on() || r.dragged() || wheel_burst || wheeled;
                 let started: Option<u8> = ui.data(|d| d.get_temp(vol_id));
                 if held && started.is_none() {
                     ui.data_mut(|d| d.insert_temp(vol_id, vol_at_start));
@@ -3087,6 +3224,38 @@ fn list_diffs(dir: &Path) -> Vec<String> {
 
 /// Reserve a full-width row and split it into a fixed header column and a lane
 /// rectangle, so every lane shares the exact same x range.
+/// This frame's mouse wheel input in notches (one notch = 1.0, wheel up / away = positive).
+fn wheel_notches(ui: &egui::Ui) -> Vec<(f32, Modifiers)> {
+    ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::MouseWheel { unit, delta, modifiers, .. } => {
+                    let d = delta.y + delta.x;
+                    let n = match unit {
+                        egui::MouseWheelUnit::Line => d,
+                        egui::MouseWheelUnit::Point => d / 40.0,
+                        egui::MouseWheelUnit::Page => d * 3.0,
+                    };
+                    Some((n, *modifiers))
+                }
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// Wheel over a hovered slider nudges its value by `step` per notch (Alt is left for the overall volume).
+fn wheel_nudge(ui: &mut egui::Ui, r: &egui::Response, v: &mut f32, step: f32, lo: f32, hi: f32) {
+    if !r.hovered() {
+        return;
+    }
+    let n: f32 = wheel_notches(ui).iter().filter(|(_, m)| !m.alt && !m.command).map(|(n, _)| n).sum();
+    if n != 0.0 {
+        *v = (((*v + n * step) / step).round() * step).clamp(lo, hi);
+    }
+}
+
 fn lane_row(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, height: f32, lane_left: f32, lane_right: f32) -> (Rect, Rect, egui::Response) {
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let header = Rect::from_min_max(row.min, pos2(lane_left - 8.0, row.bottom()));
@@ -3098,4 +3267,10 @@ fn lane_row(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, heigh
 fn fmt_time(ms: f64) -> String {
     let ms = ms.max(0.0) as u64;
     format!("{:02}:{:02}.{:03}", ms / 60_000, (ms / 1000) % 60, ms % 1000)
+}
+
+/// Smoothstep easing for fades.
+fn ease(k: f32) -> f32 {
+    let k = k.clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
 }

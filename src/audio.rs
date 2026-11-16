@@ -285,6 +285,10 @@ impl Engine {
             m.cursor = m.events.partition_point(|e| (e.frame as f64) < m.pos);
         });
     }
+    /// Overall output volume (Alt+wheel), applied after the song and hitsound volumes.
+    pub fn set_master(&self, v: f32) {
+        self.with(|m| m.master = v);
+    }
     pub fn set_gains(&self, song: f32, hits: f32) {
         self.with(|m| {
             m.song_gain = song;

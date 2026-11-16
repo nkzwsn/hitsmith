@@ -82,11 +82,15 @@ pub struct ControlPoint {
 pub struct ExportOptions {
     pub diff_name: String,
     pub start_index: u32,
+    /// Game mode of the exported difficulty (0 standard, 1 taiko, 2 catch, 3 mania);
+    /// `None` = the same as the timing difficulty.
+    #[serde(default)]
+    pub mode: Option<u8>,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { diff_name: "Hitsounds".into(), start_index: 1 }
+        Self { diff_name: "Hitsounds".into(), start_index: 1, mode: None }
     }
 }
 

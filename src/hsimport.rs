@@ -87,6 +87,7 @@ pub fn import(text: &str, library: &[SampleEntry], first_id: u64) -> Imported {
 
     // Sound (set, kind, index) -> times.
     let mut sounds: BTreeMap<(u8, &'static str, u32), Vec<i64>> = BTreeMap::new();
+    let mut keysounds: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     let mut hits = 0;
     for o in &objects {
         if o.len() < 5 {
@@ -97,7 +98,10 @@ pub fn import(text: &str, library: &[SampleEntry], first_id: u64) -> Imported {
         // hitSample is the last field for circles/spinners; for sliders the head uses
         // edgeSounds/edgeSets (fields 8/9) when present.
         let mut sample_field = o.last().cloned().unwrap_or_default();
-        if kind & 2 != 0 {
+        if kind & 128 != 0 {
+            // osu!mania hold note: "endTime:normalSet:addSet:index:volume:filename".
+            sample_field = o.get(5).and_then(|f| f.split_once(':')).map(|(_, rest)| rest.to_string()).unwrap_or_default();
+        } else if kind & 2 != 0 {
             if let Some(edges) = o.get(8) {
                 bits = edges.split('|').next().and_then(|s| s.parse().ok()).unwrap_or(bits);
             }
@@ -136,7 +140,13 @@ pub fn import(text: &str, library: &[SampleEntry], first_id: u64) -> Imported {
         };
         let ms = t.round() as i64;
         hits += 1;
-        sounds.entry((normal_set, "normal", index)).or_default().push(ms);
+        // A file named on the hit (osu!mania keysounds) plays instead of the hitnormal.
+        let keysound = s.get(4).map(|f| f.trim()).filter(|f| !f.is_empty()).map(str::to_string);
+        if let Some(file) = keysound {
+            keysounds.entry(file).or_default().push(ms);
+        } else {
+            sounds.entry((normal_set, "normal", index)).or_default().push(ms);
+        }
         for (bit, name) in [(2, "whistle"), (4, "finish"), (8, "clap")] {
             if bits & bit != 0 {
                 sounds.entry((add_set, name, index)).or_default().push(ms);
@@ -171,6 +181,17 @@ pub fn import(text: &str, library: &[SampleEntry], first_id: u64) -> Imported {
             },
         };
         let entry = by_sample.entry(label).or_insert((sample, Vec::new()));
+        entry.1.extend(times);
+    }
+
+    for (file, times) in keysounds {
+        let found = library.iter().find(|e| e.r.source != SampleSource::Skin && e.r.file.eq_ignore_ascii_case(&file));
+        if found.is_none() {
+            missing.push(file.clone());
+        }
+        let stem = file.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_else(|| file.clone());
+        let label = if found.is_some() { stem } else { format!("{stem} (missing)") };
+        let entry = by_sample.entry(label).or_insert((found.map(|e| e.r.clone()), Vec::new()));
         entry.1.extend(times);
     }
 
@@ -253,6 +274,31 @@ mod tests {
         assert!(imp.tracks[0].name.contains("hitnormal"));
         // Volumes 70 -> 80.
         assert_eq!(imp.control_points.iter().map(|c| (c.time, c.volume)).collect::<Vec<_>>(), vec![(0, 70), (1000, 80)]);
+        assert!(imp.missing.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mania_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn hold_notes_and_keysounds() {
+        let text = "osu file format v14\r\n[General]\r\nSampleSet: Normal\r\nMode: 3\r\n[TimingPoints]\r\n0,500,4,1,0,60,1,0\r\n[HitObjects]\r\n64,192,1000,128,2,1500:2:0:0:0:\r\n192,192,2000,1,0,0:0:0:80:kick.wav\r\n";
+        let lib = vec![
+            SampleEntry { r: SampleRef { source: SampleSource::Mapset, file: "kick.wav".into() }, path: PathBuf::from("kick.wav") },
+            SampleEntry { r: SampleRef { source: SampleSource::Skin, file: "soft-hitnormal.wav".into() }, path: PathBuf::from("a") },
+            SampleEntry { r: SampleRef { source: SampleSource::Skin, file: "soft-hitwhistle.wav".into() }, path: PathBuf::from("b") },
+        ];
+        let imp = import(text, &lib, 1);
+        let names: Vec<&str> = imp.tracks.iter().map(|t| t.name.as_str()).collect();
+        // Hold note: the sample set (2 = soft) comes after the end time, not the end time itself.
+        assert!(names.contains(&"soft-hitnormal (skin)"), "{names:?}");
+        assert!(names.contains(&"soft-hitwhistle (skin)"), "{names:?}");
+        // Keysound note plays kick.wav instead of a hitnormal.
+        let kick = imp.tracks.iter().find(|t| t.name == "kick").expect("keysound track");
+        assert_eq!(kick.notes, vec![2000]);
         assert!(imp.missing.is_empty());
     }
 }

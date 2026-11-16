@@ -64,6 +64,8 @@ pub struct Report {
     pub clipped: usize,
     pub first_index: u32,
     pub last_index: u32,
+    /// Set for a keysounded osu!mania export: the key count.
+    pub keys: Option<usize>,
 }
 
 fn hitnormal_name(index: u32, ext: &str) -> String {
@@ -139,6 +141,12 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
         bail!("There are no notes to export.");
     }
 
+    // osu!mania: keysound every sound as its own note when they fit in 10 columns.
+    let target_mode = opts.mode.unwrap_or(source.meta.mode).min(3);
+    let max_together = moments.values().map(|v| v.len()).max().unwrap_or(1);
+    let mania_keysounds = target_mode == 3 && max_together <= 10;
+    let moments_for_mania = if mania_keysounds { Some(moments.clone()) } else { None };
+
     // 2. Distinct combinations become one generated sample each.
     let mut combos: Vec<Vec<(PathBuf, u32)>> = Vec::new();
     let mut combo_of: HashMap<Vec<(PathBuf, u32)>, usize> = HashMap::new();
@@ -183,6 +191,9 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
     }
     if dir.join(&osu_name).exists() && !owned(&osu_name) {
         bail!("\"{osu_name}\" already exists and wasn't made by this app. Pick another difficulty name.");
+    }
+    if let Some(moments) = moments_for_mania {
+        return export_mania(project, &source, &reds, &moments, dir, manifest, key, previous, osu_name, diff_name);
     }
 
     // 5. Render samples.
@@ -269,13 +280,13 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
     // 7. Write the difficulty from the source as a template.
     let mut text = osu::set_value(&source.text, "Metadata", "Version", diff_name);
     text = osu::set_value(&text, "Metadata", "BeatmapID", "0");
-    // The project's bookmarks replace the source's (an empty list clears them).
-    if project.bookmarks.is_empty() {
-        text = osu::remove_value(&text, "Editor", "Bookmarks");
-    } else {
-        let marks: Vec<String> = project.bookmarks.iter().map(|b| b.to_string()).collect();
-        text = osu::ensure_section(&text, "Editor", "Metadata");
-        text = osu::set_value(&text, "Editor", "Bookmarks", &marks.join(","));
+    text = apply_bookmarks(&text, project);
+    if target_mode != source.meta.mode {
+        text = osu::set_value(&text, "General", "Mode", &target_mode.to_string());
+        // CircleSize is the key count in mania: 4 keys going in, a normal circle size coming out.
+        if target_mode == 3 || source.meta.mode == 3 {
+            text = osu::set_value(&text, "Difficulty", "CircleSize", "4");
+        }
     }
     text = osu::replace_section(&text, "TimingPoints", &timing.join("\r\n"));
     text = osu::replace_section(&text, "HitObjects", &objects.join("\r\n"));
@@ -310,7 +321,122 @@ pub fn export(project: &Project, library: &[SampleEntry]) -> Result<Report> {
         clipped,
         first_index: *indices.first().unwrap_or(&start_index),
         last_index: *indices.last().unwrap_or(&start_index),
+        keys: None,
     })
+}
+
+/// The project's bookmarks replace the source's (an empty list clears them).
+fn apply_bookmarks(text: &str, project: &Project) -> String {
+    if project.bookmarks.is_empty() {
+        osu::remove_value(text, "Editor", "Bookmarks")
+    } else {
+        let marks: Vec<String> = project.bookmarks.iter().map(|b| b.to_string()).collect();
+        let t = osu::ensure_section(text, "Editor", "Metadata");
+        osu::set_value(&t, "Editor", "Bookmarks", &marks.join(","))
+    }
+}
+
+/// osu!mania hitsound difficulty, keysounded: every sound is its own note naming its own
+/// file (any file name works), sounds that play together go in separate columns, and the
+/// key count is the most sounds that ever play at once.
+#[allow(clippy::too_many_arguments)]
+fn export_mania(
+    project: &Project,
+    source: &osu::Beatmap,
+    reds: &[RawRed],
+    moments: &BTreeMap<i64, Vec<(PathBuf, u32)>>,
+    dir: &Path,
+    mut manifest: Manifest,
+    key: String,
+    previous: Vec<String>,
+    osu_name: String,
+    diff_name: &str,
+) -> Result<Report> {
+    let keys = moments.values().map(|v| v.len()).max().unwrap_or(1).clamp(1, 10);
+    // Sound files in the mapset are used by name; others (project, skin) are copied in.
+    let mapset = dir.canonicalize().ok();
+    let mut names: HashMap<PathBuf, String> = HashMap::new();
+    let mut copies: Vec<(PathBuf, String)> = Vec::new();
+    for parts in moments.values() {
+        for (p, _) in parts {
+            if names.contains_key(p) {
+                continue;
+            }
+            let file = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let in_mapset = mapset.is_some() && p.parent().and_then(|d| d.canonicalize().ok()) == mapset;
+            let name = if in_mapset {
+                file
+            } else {
+                let mut cand = format!("hitsmith-{file}");
+                let mut n = 2;
+                while (dir.join(&cand).exists() && !previous.iter().any(|f| f.eq_ignore_ascii_case(&cand))) || copies.iter().any(|(_, c)| c.eq_ignore_ascii_case(&cand)) {
+                    cand = format!("hitsmith-{n}-{file}");
+                    n += 1;
+                }
+                copies.push((p.clone(), cand.clone()));
+                cand
+            };
+            names.insert(p.clone(), name);
+        }
+    }
+    // Record ownership before writing anything.
+    let mut planned: Vec<String> = copies.iter().map(|(_, c)| c.clone()).collect();
+    planned.push(osu_name.clone());
+    {
+        let entry = manifest.exports.entry(key.clone()).or_default();
+        for f in &planned {
+            if !entry.iter().any(|e| e.eq_ignore_ascii_case(f)) {
+                entry.push(f.clone());
+            }
+        }
+    }
+    write_manifest(dir, &manifest)?;
+    for (src, name) in &copies {
+        fs::copy(src, dir.join(name)).with_context(|| format!("copying {}", src.display()))?;
+    }
+
+    let mut objects = Vec::new();
+    for (&t, parts) in moments {
+        let mut parts = parts.clone();
+        parts.sort();
+        for (col, (p, gain)) in parts.iter().enumerate() {
+            let volume = ((*gain as f64 / 1000.0) * project.volume_at(t) as f64).round().clamp(5.0, 100.0) as u32;
+            let x = ((col as f64 + 0.5) * 512.0 / keys as f64).floor() as u32;
+            objects.push(format!("{x},192,{t},1,0,0:0:0:{volume}:{}", names[p]));
+        }
+    }
+    let timing: Vec<String> = reds.iter().map(|r| r.fields.join(",")).collect();
+
+    let mut text = osu::set_value(&source.text, "Metadata", "Version", diff_name);
+    text = osu::set_value(&text, "Metadata", "BeatmapID", "0");
+    text = osu::set_value(&text, "General", "Mode", "3");
+    text = osu::set_value(&text, "Difficulty", "CircleSize", &keys.to_string());
+    text = apply_bookmarks(&text, project);
+    text = osu::replace_section(&text, "TimingPoints", &timing.join("\r\n"));
+    text = osu::replace_section(&text, "HitObjects", &objects.join("\r\n"));
+    let osu_tmp = dir.join(format!("{osu_name}.tmp"));
+    let wrote = fs::write(&osu_tmp, text.as_bytes()).and_then(|_| fs::rename(&osu_tmp, dir.join(&osu_name)));
+    if let Err(e) = wrote {
+        let _ = fs::remove_file(&osu_tmp);
+        return Err(anyhow::Error::new(e).context(format!("writing {osu_name} (is it open in osu!?)")));
+    }
+
+    let written = planned;
+    let others: Vec<String> = manifest.exports.iter().filter(|(k, _)| **k != key).flat_map(|(_, v)| v.clone()).collect();
+    for old in &previous {
+        let still_mine = written.iter().any(|w| w.eq_ignore_ascii_case(old));
+        let used_elsewhere = others.iter().any(|o| o.eq_ignore_ascii_case(old));
+        if !still_mine && !used_elsewhere {
+            let p = dir.join(old);
+            if p.parent() == Some(dir) {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let copied = copies.len();
+    manifest.exports.insert(key, written);
+    write_manifest(dir, &manifest)?;
+    Ok(Report { osu_file: osu_name, circles: objects.len(), sample_files: copied, clipped: 0, first_index: 0, last_index: 0, keys: Some(keys) })
 }
 
 #[cfg(test)]
@@ -396,6 +522,42 @@ mod tests {
         assert!(dir.join(&b.osu_file).exists());
         // Bookmarks: none in the project means none in the export.
         assert!(!fs::read_to_string(dir.join(&a2.osu_file)).unwrap().contains("Bookmarks"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_game_mode_choice() {
+        let dir = std::env::temp_dir().join(format!("hitsmith-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = "osu file format v14\r\n\r\n[General]\r\nAudioFilename: a.mp3\r\nMode: 1\r\n\r\n[Metadata]\r\nTitle:S\r\nArtist:A\r\nCreator:c\r\nVersion:Oni\r\n\r\n[Difficulty]\r\nCircleSize:5\r\n\r\n[TimingPoints]\r\n0,500,4,2,0,60,1,0\r\n\r\n[HitObjects]\r\n";
+        fs::write(dir.join("A - S (c) [Oni].osu"), src).unwrap();
+        let clap = dir.join("clap.wav");
+        audio::write_wav(&clap, &Pcm { rate: 44_100, data: vec![0.2; 400] }).unwrap();
+        let lib = vec![SampleEntry { r: SampleRef { source: SampleSource::Mapset, file: "clap.wav".into() }, path: clap }];
+        let mut p = Project::new(dir.clone(), "A - S (c) [Oni].osu".into());
+        p.content.tracks = vec![Track { id: 1, name: "c".into(), sample: Some(lib[0].r.clone()), volume: 100, muted: false, solo: false, color: 0, notes: vec![0, 500], key: None }];
+        // Same as timing difficulty: stays taiko.
+        let r = export(&p, &lib).unwrap();
+        assert!(fs::read_to_string(dir.join(&r.osu_file)).unwrap().contains("Mode: 1"));
+        // osu!mania: keysounded, one column per sound playing together (here 2), file names on notes.
+        let kick = dir.join("LR_Drum Kick.wav");
+        audio::write_wav(&kick, &Pcm { rate: 44_100, data: vec![0.1; 400] }).unwrap();
+        let mut lib2 = lib.clone();
+        lib2.push(SampleEntry { r: SampleRef { source: SampleSource::Mapset, file: "LR_Drum Kick.wav".into() }, path: kick });
+        p.content.tracks.push(Track { id: 2, name: "k".into(), sample: Some(lib2[1].r.clone()), volume: 50, muted: false, solo: false, color: 1, notes: vec![0], key: None });
+        p.export.mode = Some(3);
+        let r = export(&p, &lib2).unwrap();
+        assert_eq!(r.keys, Some(2));
+        let out = fs::read_to_string(dir.join(&r.osu_file)).unwrap();
+        assert!(out.contains("Mode:3") && out.contains("CircleSize:2"), "{out}");
+        assert!(out.contains(":LR_Drum Kick.wav") && out.contains(":clap.wav"), "{out}");
+        assert!(out.contains("128,192,0,1,0,0:0:0:") && out.contains("384,192,0,1,0,0:0:0:"), "two columns at t=0: {out}");
+        p.content.tracks.truncate(1);
+        // osu!standard.
+        p.export.mode = Some(0);
+        let r = export(&p, &lib).unwrap();
+        assert!(fs::read_to_string(dir.join(&r.osu_file)).unwrap().contains("Mode:0"));
         fs::remove_dir_all(&dir).ok();
     }
 }

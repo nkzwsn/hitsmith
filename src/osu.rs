@@ -18,6 +18,9 @@ pub struct Meta {
     /// osu! beatmap set ID (0 or -1 when unsubmitted).
     #[serde(default)]
     pub set_id: i64,
+    /// Game mode: 0 standard, 1 taiko, 2 catch, 3 mania.
+    #[serde(default)]
+    pub mode: u8,
 }
 
 impl Meta {
@@ -111,8 +114,10 @@ pub fn parse_meta(text: &str) -> Meta {
         }
         match section {
             "General" => {
-                if let Some(("AudioFilename", v)) = split_kv(line) {
-                    meta.audio_filename = v.to_string();
+                match split_kv(line) {
+                    Some(("AudioFilename", v)) => meta.audio_filename = v.to_string(),
+                    Some(("Mode", v)) => meta.mode = v.trim().parse().unwrap_or(0),
+                    _ => {}
                 }
             }
             "Metadata" => {

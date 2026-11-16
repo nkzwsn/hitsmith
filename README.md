@@ -24,7 +24,8 @@ Keyboard shortcuts follow the osu! editor (press **Keys** in the toolbar for the
 | Left / Right (Shift: 4x), mouse wheel | Step one snap tick, seek |
 | Up / Down | Previous / next timing or volume point |
 | Ctrl+wheel, Shift+1..9 | Change snap divisor |
-| Alt+wheel | Zoom |
+| Alt+wheel | Zoom (over the timeline); overall volume (anywhere else) |
+| Wheel over a volume slider or volume point | Change it 5% (Shift: 1% on points) |
 | Ctrl+Up / Down | Playback speed (25% steps, Shift: 5%) |
 | 1 / 2 | Select tool / Place tool |
 | Sample keys (default Q / W / E / R) | Toggle a hit at the playhead on that sample; click a sample's key cap to change it |
@@ -44,6 +45,11 @@ Deleting a project moves it to the Recycle Bin.
 Every distinct set of sounds that plays at the same moment is mixed into one `normal-hitnormalN.wav`.
 Each circle plays only its hitnormal, and green lines pick the sample index and volume. This reproduces
 the arrangement exactly, regardless of skin or layering settings.
+
+The game mode can be chosen in the Export window. For **osu!mania** the export is keysounded instead:
+every sound is its own note naming its sound file (any file name works), sounds that play together go in
+separate columns, and the key count is the most sounds that ever play at once (up to 10). Sound files from
+outside the mapset are copied in. More than 10 at once falls back to the mixed method.
 
 Safety rules:
 
