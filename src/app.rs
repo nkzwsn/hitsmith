@@ -1126,6 +1126,10 @@ impl Work {
         }
         let playing = engine.map(|e| e.is_playing()).unwrap_or(false);
         let pos = engine.map(|e| e.position_ms()).unwrap_or(0.0);
+        // Starting playback turns Follow back on (scrolling by hand turns it off).
+        if playing && !self.playing_now {
+            self.follow = true;
+        }
         self.pos_now = pos;
         self.playing_now = playing;
         if playing {
@@ -1682,7 +1686,9 @@ impl Work {
 
         // A drag whose widget vanished (e.g. undo removed the track) never gets its
         // "stopped" event; drop it once the mouse is released.
-        if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+        // egui drops its own drag when the window loses focus or is minimized, even if we
+        // never saw the mouse release; follow it so a stale drag can't freeze the view.
+        if self.drag.is_some() && (ctx.dragged_id().is_none() || !ctx.input(|i| i.pointer.any_down())) {
             self.drag = None;
         }
         go_home
@@ -2001,7 +2007,7 @@ impl Work {
         if resp.drag_started() {
             self.drag = Some(Drag::Pan { start_view: self.view_start });
         }
-        if let Some(Drag::Pan { start_view }) = &self.drag {
+        if let (Some(Drag::Pan { start_view }), true) = (&self.drag, resp.dragged()) {
             let total = resp.total_drag_delta().map(|d| d.x).unwrap_or(0.0);
             self.view_start = start_view - (total / self.project.zoom) as f64;
             self.follow = false;
