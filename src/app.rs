@@ -841,6 +841,8 @@ struct Work {
     renaming: Option<(u64, String)>,
     pos_now: f64,
     playing_now: bool,
+    /// Set while scrolling by hand: Follow waits until shortly after the last scroll.
+    follow_hold: Option<Instant>,
     /// Mirrors the saved setting; the App writes it back when it changes.
     scrub_sound: bool,
 }
@@ -908,6 +910,7 @@ impl Work {
             renaming: None,
             pos_now: 0.0,
             playing_now: false,
+            follow_hold: None,
             scrub_sound: false,
         };
         if let Some(e) = engine {
@@ -1301,9 +1304,13 @@ impl Work {
                 let total = self.duration();
                 ui.spacing_mut().slider_width = (ui.available_width() - 360.0).max(100.0);
                 let mut v = self.view_start;
-                if ui.add(egui::Slider::new(&mut v, -2000.0..=total).show_value(false)).on_hover_text("Scroll the timeline").changed() {
+                let r = ui.add(egui::Slider::new(&mut v, -2000.0..=total).show_value(false)).on_hover_text("Scroll the timeline");
+                if r.changed() {
                     self.view_start = v;
-                    self.follow = false;
+                }
+                if r.changed() || r.dragged() {
+                    // Hold Follow while scrolling by hand; it catches up shortly after.
+                    self.follow_hold = Some(Instant::now());
                 }
                 let sel = self.selected.len();
                 let info = if sel > 0 { format!("{sel} selected") } else { format!("{} hits", self.project.content.tracks.iter().map(|t| t.notes.len()).sum::<usize>()) };
@@ -1390,7 +1397,12 @@ impl Work {
                 // Keep egui from also scrolling the track list or zooming.
                 ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
             }
-            if playing && self.follow {
+            // Follow pauses for a moment after scrolling by hand, then catches up with the playhead.
+            let holding = self.follow_hold.is_some_and(|t| t.elapsed() < Duration::from_millis(1500));
+            if !holding {
+                self.follow_hold = None;
+            }
+            if playing && self.follow && !holding {
                 let span = grid_w as f64 / self.project.zoom as f64;
                 if pos > self.view_start + span * 0.85 || pos < self.view_start {
                     self.view_start = pos - span * 0.15;
@@ -2010,7 +2022,7 @@ impl Work {
         if let (Some(Drag::Pan { start_view }), true) = (&self.drag, resp.dragged()) {
             let total = resp.total_drag_delta().map(|d| d.x).unwrap_or(0.0);
             self.view_start = start_view - (total / self.project.zoom) as f64;
-            self.follow = false;
+            self.follow_hold = Some(Instant::now());
         }
         if resp.drag_stopped() {
             self.drag = None;
